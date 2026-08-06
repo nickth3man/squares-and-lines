@@ -11,6 +11,7 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <deque>
 #include <filesystem>

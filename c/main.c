@@ -33,6 +33,7 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------------------
  * Configuration
