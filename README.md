@@ -2,28 +2,68 @@
 
 An infinite spatial canvas for exploring interconnected concepts with AI-generated text. Start with any topic and branch non-linearly: every generated node contains explanatory markdown with **clickable key terms** and **suggested follow-up prompts** — click either to spawn a child node and grow a knowledge tree you can pan, zoom, drag, and re-generate.
 
-## Features
+## Architecture
 
-- **Infinite canvas** — pan (drag background), zoom (Ctrl+wheel / toolbar buttons), draggable nodes, minimap with live viewport, collision-aware child placement.
-- **AI text nodes** — each node is a markdown card where 2–4 key concepts are `[Term](Term)` links; clicking one branches off into a new node.
-- **Follow-up prompts** — every node suggests 3 next topics; click to expand.
-- **Versioning** — Regenerate appends a new version per node (stacked-card UI, toolbar switcher).
-- **Provider-agnostic LLM layer** — no SDK, no vendor lock-in; swap models/providers via env vars.
+The frontend and backend are **fully decoupled**. The frontend is a React 19 SPA (shared across all backends); the backend serves static files + a single API endpoint.
 
-## Stack
+```
+POST /api/generate   { "prompt": "string" }   →   { "text": "string", "prompts": ["string", ...] }
+```
 
-- **Client:** React 19, Vite 6, Tailwind CSS v4, motion, react-markdown, lucide-react
-- **Server:** Express (`server.ts`) — API + static hosting, single process on port 3000
+```
+gridscape/
+├── frontend/          Shared React SPA (Vite + Tailwind v4)
+│   └── dist/          Built output — served by every backend
+├── typescript/        Express backend (original reference impl)
+├── python/            Flask backend
+├── go/                net/http backend (zero external deps)
+├── rust/              axum backend
+├── cpp/               cpp-httplib + libcurl backend
+└── c/                 raw sockets + libcurl backend
+```
 
-## Getting Started
+Each backend implements the **exact same contract**:
 
-**Prerequisites:** Node.js 18+ (for the built-in `fetch` used by the LLM layer)
+1. Serve static files from `../frontend/dist` with SPA fallback to `index.html`.
+2. `POST /api/generate` — validate the prompt, call an OpenAI-compatible chat completions endpoint, parse the markdown response into `{ text, prompts }`.
+3. Rate limiting (20 requests/min/IP) to protect the LLM budget.
+4. Same env vars across all backends.
 
-1. `npm install`
-2. Create `.env.local` (see [.env.example](.env.example)) with an `OPENROUTER_API_KEY` from [openrouter.ai/keys](https://openrouter.ai/keys) — the account needs credits.
-3. `npm run dev` → http://localhost:3000
+The LLM contract is **JSON-free by design** — the model returns plain markdown with `[Term](Term)` links and a trailing `## Explore further` section. `parseMarkdownContent` splits these deterministically. Works with any model, including small/free ones that reject structured outputs.
+
+## Quick Start
+
+### 1. Build the frontend (once, shared by all backends)
+
+```bash
+cd frontend
+npm install
+npm run build      # → frontend/dist/
+```
+
+### 2. Pick any backend
+
+Each backend folder has its own README with setup instructions. Example with Go (zero external deps):
+
+```bash
+cd go
+export OPENROUTER_API_KEY="your-key"
+go run .
+# → http://localhost:3000
+```
+
+### 3. Dev workflow (frontend hot-reload)
+
+Run any backend on `:3000`, then:
+
+```bash
+cd frontend
+npm run dev         # → http://localhost:5173 (proxies /api → :3000)
+```
 
 ## Configuration
+
+All backends read the same environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -32,37 +72,15 @@ An infinite spatial canvas for exploring interconnected concepts with AI-generat
 | `OPENROUTER_MODEL` | `openai/gpt-oss-20b` | Model id on OpenRouter |
 | `OPENAI_API_KEY` | — | Required for the OpenAI provider |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model id on OpenAI |
+| `PORT` | `3000` | Server port |
 
-## Architecture
+Copy `.env.example` into the backend folder you're using.
 
-```
-server.ts            Express route: POST /api/generate → { text, prompts }
-providers/
-  contract.ts        TextProvider interface + shared chat-completions caller + markdown parser
-  openrouter.ts      OpenRouter provider (default)
-  openai.ts          OpenAI provider
-  index.ts           createProvider() factory (selects via AI_PROVIDER)
-src/
-  App.tsx            canvas state, pan/zoom, node spawning/versioning
-  components/        NodeCard, ConnectingLines, Minimap
-```
+## Adding a Provider
 
-**The LLM contract is JSON-free by design.** The model returns plain markdown:
+Implement the provider in each backend's code: call `{baseUrl}/chat/completions` with `system` + `user` messages, extract `choices[0].message.content`, then run it through `parseMarkdownContent`.
 
-- `[Term](Term)` links inline in the text — the clickable branching mechanism;
-- a trailing `## Explore further` section with 3 bullet-point markdown links — the follow-up prompts.
+## Stack
 
-`parseMarkdownContent` splits the two deterministically. This works with any model — including small/free models that reject structured outputs — and degrades gracefully (missing section → text-only node) instead of failing on a malformed JSON envelope.
-
-**Adding a provider:** implement `TextProvider` (`generateText(prompt) → { text, prompts }`) in `providers/`, register it in the factory, document its env vars.
-
-## Scripts
-
-| Script | What it does |
-|---|---|
-| `npm run dev` | Vite dev server + API via tsx |
-| `npm run build` | Vite client build + esbuild server bundle → `dist/` |
-| `npm start` | Run the production bundle |
-| `npm run lint` | TypeScript check (`tsc --noEmit`) |
-
-Image generation is intentionally not part of this app.
+- **Frontend:** React 19, Vite 6, Tailwind CSS v4, motion, react-markdown, lucide-react
+- **Backends:** TypeScript (Express), Python (Flask), Go (net/http), Rust (axum), C++ (cpp-httplib), C (raw sockets)

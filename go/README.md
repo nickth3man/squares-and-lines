@@ -1,0 +1,45 @@
+# Gridscape — Go Backend
+
+Serves the Gridscape frontend and proxies LLM text generation via an
+OpenAI-compatible chat completions API. **Zero external dependencies** —
+uses only the Go standard library.
+
+## Prerequisites
+
+- Go 1.22+
+- The frontend built to `../frontend/dist` (run `npm install && npm run build` in `frontend/`)
+
+## Run
+
+```bash
+cd go
+go run .
+```
+
+The server starts on `http://localhost:3000`.
+
+## Build
+
+```bash
+go build -o gridscape.exe .
+./gridscape
+```
+
+## Configuration
+
+Set environment variables before running (copy from `../typescript/.env.example`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AI_PROVIDER` | `openrouter` | LLM provider: `openrouter` or `openai` |
+| `OPENROUTER_API_KEY` | — | Required for the OpenRouter provider |
+| `OPENROUTER_MODEL` | `openai/gpt-oss-20b` | Model id on OpenRouter |
+| `OPENAI_API_KEY` | — | Required for the OpenAI provider |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Model id on OpenAI |
+| `PORT` | `3000` | Server port |
+
+## Dev workflow
+
+For frontend hot-reload during development, run this backend on `:3000`
+and the Vite dev server (`npm run dev` in `frontend/`) on `:5173`.
+The Vite config proxies `/api` calls to `:3000`.

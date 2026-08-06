@@ -1,10 +1,9 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Search, Play, Sparkles, ZoomIn, ZoomOut, MessageSquare, Share } from 'lucide-react';
+import React, { useState, useRef, useCallback } from 'react';
+import { Search, Play, Sparkles, ZoomIn, ZoomOut } from 'lucide-react';
 import { GridNodeData } from './types';
 import { NodeCard } from './components/NodeCard';
 import { ConnectingLines } from './components/ConnectingLines';
 import { Minimap } from './components/Minimap';
-import { motion } from 'motion/react';
 
 const NODE_WIDTH = 400;
 
@@ -26,8 +25,9 @@ export default function App() {
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
   const nodeDragStartInfo = useRef({ x: 0, y: 0, nodeX: 0, nodeY: 0 });
 
-  // Focus tracking
-  const [activeNode, setActiveNode] = useState<string | null>(null);
+  // Always-current nodes ref so callbacks can be stable (useCallback []).
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
 
   // Panning Support
   const handlePointerDown = (e: React.PointerEvent) => {
@@ -46,12 +46,11 @@ export default function App() {
     }
   };
 
-  const handleNodePointerDown = (e: React.PointerEvent, nodeId: string) => {
-    // Only allow drag if clicking the header or specific handle, handled by the event target in NodeCard
+  const handleNodeDragStart = useCallback((e: React.PointerEvent, nodeId: string) => {
     e.stopPropagation();
     // Capture pointer on the element being grabbed so fast drags don't break
     e.currentTarget.setPointerCapture(e.pointerId);
-    const node = nodes.find(n => n.id === nodeId);
+    const node = nodesRef.current.find(n => n.id === nodeId);
     if (!node) return;
     setDraggingNodeId(nodeId);
     nodeDragStartInfo.current = {
@@ -60,7 +59,7 @@ export default function App() {
       nodeX: node.x,
       nodeY: node.y,
     };
-  };
+  }, []);
 
   const handlePointerMove = (e: React.PointerEvent) => {
     if (isDragging) {
@@ -89,7 +88,7 @@ export default function App() {
   };
 
   const handleWheel = (e: React.WheelEvent) => {
-    // Disable zooming for now, just pan
+    // Ctrl/Meta+wheel zooms; plain wheel pans
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
       const zoomFactor = -e.deltaY * 0.002;
@@ -142,7 +141,7 @@ export default function App() {
     }));
   }, []);
 
-  const generateNode = async (prompt: string, x: number, y: number, parentId?: string, isRegenerationOf?: string) => {
+  const generateNode = useCallback(async (prompt: string, x: number, y: number, parentId?: string, isRegenerationOf?: string) => {
     const id = isRegenerationOf || `node-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     
     // Create new node or update existing to 'generating'
@@ -164,7 +163,6 @@ export default function App() {
     }
     
     // Center view locally
-    // Use timeout to let render happen first
     setTimeout(() => centerOnPosition(x, y), 50);
 
     try {
@@ -202,7 +200,7 @@ export default function App() {
       console.error(error);
       setNodes(prev => prev.map(node => node.id === id ? { ...node, status: 'error' } : node));
     }
-  };
+  }, [centerOnPosition]);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -217,8 +215,8 @@ export default function App() {
     generateNode(ideas[Math.floor(Math.random() * ideas.length)], 0, 0);
   };
 
-  const handleExpand = (prompt: string, parentId: string) => {
-    const parent = nodes.find(n => n.id === parentId);
+  const handleExpand = useCallback((prompt: string, parentId: string) => {
+    const parent = nodesRef.current.find(n => n.id === parentId);
     if (!parent) return;
     
     // Spawn to the right
@@ -227,20 +225,24 @@ export default function App() {
     // Add initial offset so the line is never perfectly straight
     const initialOffset = Math.random() > 0.5 ? 200 : -200;
     let newY = parent.y + initialOffset;
-    const estimatedHeight = 850; // Average node height to avoid overlap
+    const cardWidth = parent.width;
+    const cardHeight = parent.height || 400;
     
     let isOccupied = true;
     let offsetMultiplier = 1;
     let direction = Math.random() > 0.5 ? 1 : -1; // 1 for down, -1 for up
     
+    // AABB overlap detection using measured card dimensions
     while (isOccupied) {
-      isOccupied = nodes.some(n => 
-        Math.abs(n.x - newX) < 200 && // Roughly in the same column
-        Math.abs(n.y - newY) < estimatedHeight // Overlaps vertically
-      );
+      isOccupied = nodesRef.current.some(n => {
+        const nH = n.height || 400;
+        const xOverlap = Math.abs((n.x + cardWidth / 2) - (newX + cardWidth / 2)) < cardWidth;
+        const yOverlap = Math.abs((n.y + nH / 2) - (newY + cardHeight / 2)) < (nH + cardHeight) / 2;
+        return xOverlap && yOverlap;
+      });
       
       if (isOccupied) {
-        newY = parent.y + initialOffset + (estimatedHeight * offsetMultiplier * direction);
+        newY = parent.y + initialOffset + (cardHeight * offsetMultiplier * direction);
         direction *= -1;
         if (direction === 1) {
           offsetMultiplier++;
@@ -249,16 +251,16 @@ export default function App() {
     }
     
     generateNode(prompt, newX, newY, parentId);
-  };
+  }, [generateNode]);
 
-  const handleRegenerate = (nodeId: string) => {
-    const node = nodes.find(n => n.id === nodeId);
+  const handleRegenerate = useCallback((nodeId: string) => {
+    const node = nodesRef.current.find(n => n.id === nodeId);
     if (node) {
       generateNode(node.prompt, node.x, node.y, node.parentId, nodeId);
     }
-  };
+  }, [generateNode]);
 
-  const handleDelete = (nodeId: string) => {
+  const handleDelete = useCallback((nodeId: string) => {
     // Delete this node and all descendants
     const getDescendants = (id: string, allNodes: GridNodeData[]): string[] => {
       const children = allNodes.filter(n => n.parentId === id).map(n => n.id);
@@ -269,13 +271,17 @@ export default function App() {
       return desc;
     };
     
-    const toDelete = [nodeId, ...getDescendants(nodeId, nodes)];
+    const toDelete = [nodeId, ...getDescendants(nodeId, nodesRef.current)];
     setNodes(prev => prev.filter(n => !toDelete.includes(n.id)));
-  };
+  }, []);
 
-  const setVersion = (nodeId: string, versionIndex: number) => {
+  const setVersion = useCallback((nodeId: string, versionIndex: number) => {
     setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, versionIndex } : n));
-  };
+  }, []);
+
+  const handleMeasure = useCallback((nodeId: string, height: number) => {
+    setNodes(prev => prev.map(n => (n.id === nodeId && n.height !== height) ? { ...n, height } : n));
+  }, []);
   
   const totalChars = nodes.reduce((acc, node) => acc + ((node.versions[node.versionIndex]?.text?.length) || 0), 0);
 
@@ -309,7 +315,8 @@ export default function App() {
             onRegenerate={handleRegenerate}
             onClose={handleDelete}
             setVersion={setVersion}
-            onPointerDown={(e) => handleNodePointerDown(e, node.id)}
+            onNodeDragStart={handleNodeDragStart}
+            onMeasure={handleMeasure}
           />
         ))}
       </div>
@@ -337,12 +344,14 @@ export default function App() {
               <button 
                 onClick={handleSearchSubmit}
                 className="flex-1 sm:flex-none sm:w-12 h-12 bg-black text-white flex items-center justify-center hover:bg-gray-800 transition-colors cursor-pointer"
+                aria-label="Explore topic"
               >
                 <Play fill="currentColor" size={20} />
               </button>
               <button 
                 onClick={handleMagicWand}
                 className="flex-1 sm:flex-none sm:w-12 h-12 border-2 border-black text-black bg-yellow-100 flex items-center justify-center hover:bg-yellow-200 transition-colors cursor-pointer"
+                aria-label="Surprise me with a random topic"
               >
                 <Sparkles size={20} />
               </button>
@@ -383,6 +392,7 @@ export default function App() {
               <button 
                 onClick={() => handleZoom(-0.2)}
                 className="w-8 h-8 md:w-10 md:h-10 flex items-center justify-center hover:bg-gray-800 rounded-lg transition-colors mx-1 cursor-pointer"
+                aria-label="Zoom out"
               >
                 <ZoomOut size={16} className="md:w-[18px] md:h-[18px]" />
               </button>
@@ -390,6 +400,7 @@ export default function App() {
               <button 
                 onClick={() => handleZoom(0.2)}
                 className="w-8 h-8 md:w-10 md:h-10 flex items-center justify-center hover:bg-gray-800 rounded-lg transition-colors mr-1 cursor-pointer"
+                aria-label="Zoom in"
               >
                 <ZoomIn size={16} className="md:w-[18px] md:h-[18px]" />
               </button>
@@ -402,12 +413,14 @@ export default function App() {
       <div className="absolute top-4 left-4 md:top-6 md:left-6">
             <button 
                 onClick={() => {
-                  setNodes([]);
-                  setTransform({ 
-                    x: 0, 
-                    y: 0, 
-                    scale: typeof window !== 'undefined' && window.innerWidth < 768 ? 0.6 : 0.85 
-                  });
+                  if (window.confirm('Reset the entire canvas? All nodes will be lost.')) {
+                    setNodes([]);
+                    setTransform({ 
+                      x: 0, 
+                      y: 0, 
+                      scale: typeof window !== 'undefined' && window.innerWidth < 768 ? 0.6 : 0.85 
+                    });
+                  }
                 }}
                 className="bg-white border-2 border-black text-[10px] md:text-xs font-mono font-bold px-3 py-2 md:px-4 md:py-2 hover:bg-red-50 hover:text-red-600 transition-colors shadow-[2px_2px_0px_#000] md:shadow-[4px_4px_0px_#000] cursor-pointer cursor-auto"
             >

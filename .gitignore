@@ -1,6 +1,27 @@
+# Node
 node_modules/
-build/
 dist/
+*.cjs
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Go
+*.exe
+
+# Rust
+target/
+
+# C/C++
+*.o
+*.obj
+*.exe
+
+# General
+build/
 coverage/
 .DS_Store
 *.log

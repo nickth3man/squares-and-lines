@@ -3,6 +3,7 @@ export interface GridNodeData {
   x: number;
   y: number;
   width: number;
+  height?: number;
   prompt: string;
   text: string;
   prompts: string[];

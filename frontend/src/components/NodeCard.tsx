@@ -1,25 +1,29 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Sparkles, X, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
 import { GridNodeData } from '../types';
+import { ErrorBoundary } from './ErrorBoundary';
 
 import ReactMarkdown from 'react-markdown';
 
 const Typewriter = ({ text, onExpand, nodeId }: { text: string, onExpand: (prompt: string, parentId: string) => void, nodeId: string }) => {
+  const [isTyping, setIsTyping] = useState(true);
   const [displayedText, setDisplayedText] = useState('');
-  
+
   // Pre-process text to fix bad markdown links where href has spaces
-  const processedText = (text || '').replace(/\[([^\]]+)\]\s*\(([^)]+)\)/g, (match, p1, p2) => {
+  const processedText = useMemo(() => (text || '').replace(/\[([^\]]+)\]\s*\(([^)]+)\)/g, (match, p1, p2) => {
     return `[${p1}](${p2.replace(/\s/g, '%20')})`;
-  });
-  
+  }), [text]);
+
   useEffect(() => {
     setDisplayedText('');
+    setIsTyping(true);
     let i = 0;
-    const charsPerTick = Math.max(1, Math.floor(processedText.length / 100)); // adjust speed
+    const charsPerTick = Math.max(1, Math.floor(processedText.length / 100));
     const interval = setInterval(() => {
       if (i >= processedText.length) {
         clearInterval(interval);
+        setIsTyping(false);
       } else {
         setDisplayedText(processedText.slice(0, i + charsPerTick));
         i += charsPerTick;
@@ -28,22 +32,26 @@ const Typewriter = ({ text, onExpand, nodeId }: { text: string, onExpand: (promp
     return () => clearInterval(interval);
   }, [processedText]);
 
+  // During typing: render plain text (avoids re-parsing markdown each tick).
+  // On completion: render full markdown exactly once.
+  if (isTyping) {
+    return <div className="whitespace-pre-wrap">{displayedText}</div>;
+  }
+
   return (
     <div className="whitespace-pre-wrap">
       <ReactMarkdown
         components={{
-          a: ({ node, ...props }) => (
-            <button 
+          a: ({ node: _node, ...props }) => (
+            <button
               type="button"
               className="font-bold underline decoration-black decoration-2 hover:bg-yellow-200 transition-colors mx-1 inline"
               onClick={(e) => {
                 e.stopPropagation();
-                // Safely extract string from children if possible, or fallback to href
                 let promptText = props.href || "";
                 if (promptText.startsWith('#')) promptText = promptText.substring(1);
                 promptText = decodeURIComponent(promptText);
-                
-                // If it's a relative link or something else, prefer to use children text if it's string
+
                 if (Array.isArray(props.children) && typeof props.children[0] === 'string') {
                   promptText = props.children[0];
                 } else if (typeof props.children === 'string') {
@@ -57,7 +65,7 @@ const Typewriter = ({ text, onExpand, nodeId }: { text: string, onExpand: (promp
           )
         }}
       >
-        {displayedText}
+        {processedText}
       </ReactMarkdown>
     </div>
   );
@@ -110,25 +118,40 @@ interface NodeCardProps {
   onRegenerate: (nodeId: string) => void;
   onClose: (nodeId: string) => void;
   setVersion: (nodeId: string, versionIndex: number) => void;
-  onPointerDown?: (e: React.PointerEvent) => void;
+  onNodeDragStart?: (e: React.PointerEvent, nodeId: string) => void;
+  onMeasure?: (nodeId: string, height: number) => void;
 }
 
-export const NodeCard: React.FC<NodeCardProps> = ({ 
+export const NodeCard: React.FC<NodeCardProps> = React.memo(({
   index,
-  node, 
-  onExpand, 
-  onRegenerate, 
+  node,
+  onExpand,
+  onRegenerate,
   onClose,
   setVersion,
-  onPointerDown
+  onNodeDragStart,
+  onMeasure
 }) => {
+  const cardRef = useRef<HTMLDivElement>(null);
   const version = node.versions[node.versionIndex] || node;
   const isGenerating = node.status === 'generating';
-  
+
   const versionText = `${index + 1}.${node.versionIndex}`;
+
+  useEffect(() => {
+    const el = cardRef.current;
+    if (!el || isGenerating) return;
+    const report = () => onMeasure?.(node.id, el.offsetHeight);
+    report();
+    const ro = new ResizeObserver(report);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [node.id, isGenerating, onMeasure]);
 
   return (
     <motion.div
+      ref={cardRef}
+      layout
       initial={{ opacity: 0, scale: 0.9 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.9, transition: { duration: 0.2 } }}
@@ -142,55 +165,59 @@ export const NodeCard: React.FC<NodeCardProps> = ({
       className="flex flex-col gap-2 origin-top-left"
     >
       {/* Node Toolbar */}
-      <div 
+      <div
         className="flex items-center gap-2 text-xs font-mono cursor-grab active:cursor-grabbing w-fit"
-        onPointerDown={(e) => onPointerDown?.(e)}
+        onPointerDown={(e) => onNodeDragStart?.(e, node.id)}
       >
         <div className="bg-white border border-black rounded-full px-3 py-1.5 shadow-[2px_2px_0px_#000] flex items-center gap-3">
           <span className="font-bold">NODE {versionText}</span>
-          
+
           <div className="h-3 w-px bg-gray-300"></div>
-          
+
           <div className="flex items-center gap-1">
-            <button 
+            <button
               onClick={() => setVersion(node.id, Math.max(0, node.versionIndex - 1))}
               onPointerDown={(e) => e.stopPropagation()}
               disabled={node.versionIndex === 0}
+              aria-label="Previous version"
               className="hover:bg-gray-100 p-0.5 rounded disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed"
             >
               <ChevronLeft size={14} />
             </button>
             <span className="w-8 text-center">{node.versionIndex + 1}/{node.versions.length || 1}</span>
-            <button 
+            <button
               onClick={() => setVersion(node.id, Math.min(node.versions.length - 1, node.versionIndex + 1))}
               onPointerDown={(e) => e.stopPropagation()}
               disabled={node.versionIndex === node.versions.length - 1}
+              aria-label="Next version"
               className="hover:bg-gray-100 p-0.5 rounded disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed"
             >
               <ChevronRight size={14} />
             </button>
           </div>
-          
+
           <div className="h-3 w-px bg-gray-300"></div>
-          
+
           <span className="w-16">
             {isGenerating ? '---' : `${version.text?.length || 0} CH`}
           </span>
-          
+
           <div className="h-3 w-px bg-gray-300"></div>
-          
-          <button 
+
+          <button
             onClick={() => onRegenerate(node.id)}
             onPointerDown={(e) => e.stopPropagation()}
+            aria-label="Regenerate node"
             className="hover:text-blue-600 transition-colors cursor-pointer"
             title="Regenerate"
           >
             <Sparkles size={14} />
           </button>
-          
-          <button 
+
+          <button
             onClick={() => onClose(node.id)}
             onPointerDown={(e) => e.stopPropagation()}
+            aria-label="Delete node and descendants"
             className="hover:text-red-600 transition-colors cursor-pointer"
             title="Close"
           >
@@ -200,11 +227,11 @@ export const NodeCard: React.FC<NodeCardProps> = ({
       </div>
 
       {/* Main Card */}
-      <div 
+      <div
         className="flex flex-col shadow-[4px_4px_0px_#000] bg-white border-2 border-black rounded relative z-10"
-        onPointerDown={(e) => onPointerDown?.(e)}
+        onPointerDown={(e) => onNodeDragStart?.(e, node.id)}
       >
-        
+
         {/* Stacked effect base lines if multiple versions */}
         {node.versions.length > 1 && (
           <>
@@ -229,12 +256,14 @@ export const NodeCard: React.FC<NodeCardProps> = ({
         ) : (
           <>
             {/* Text Content */}
-            <div 
+            <div
               className="p-5 min-h-[300px] max-h-[400px] overflow-y-auto custom-scrollbar text-sm leading-relaxed cursor-text selection:bg-yellow-200"
               onPointerDown={(e) => e.stopPropagation()}
             >
               <h3 className="font-bold text-lg mb-3 uppercase tracking-tight">{node.prompt}</h3>
-              <Typewriter text={version.text} onExpand={onExpand} nodeId={node.id} />
+              <ErrorBoundary resetKey={node.id + node.versionIndex}>
+                <Typewriter text={version.text} onExpand={onExpand} nodeId={node.id} />
+              </ErrorBoundary>
             </div>
           </>
         )}
@@ -243,7 +272,7 @@ export const NodeCard: React.FC<NodeCardProps> = ({
       {/* Suggested Prompts (Spawning Side) */}
       <AnimatePresence>
         {!isGenerating && version.prompts && version.prompts.length > 0 && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0, x: -10 }}
             animate={{ opacity: 1, x: 0, transition: { delay: 0.3 } }}
             className="absolute left-full bottom-0 ml-[20px] flex flex-col gap-3 w-64"
@@ -252,7 +281,7 @@ export const NodeCard: React.FC<NodeCardProps> = ({
               <div key={idx} className="relative group">
                 {/* Visual solid horizontal line bridging the 20px gap */}
                 <div className="absolute top-1/2 right-full w-[20px] h-[2px] bg-black" />
-                
+
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
@@ -269,4 +298,4 @@ export const NodeCard: React.FC<NodeCardProps> = ({
       </AnimatePresence>
     </motion.div>
   );
-};
+});
