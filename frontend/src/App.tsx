@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Search, Play, Sparkles, ZoomIn, ZoomOut } from 'lucide-react';
 import { GridNodeData } from './types';
 import { NodeCard } from './components/NodeCard';
@@ -29,6 +29,16 @@ export default function App() {
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
 
+  // Canvas session — created on mount, used for all API calls.
+  const canvasIdRef = useRef<string>('');
+  const [canvasReady, setCanvasReady] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/canvas', { method: 'POST' })
+      .then(res => res.json())
+ .then(data => { canvasIdRef.current = data.canvasId; setCanvasReady(true); })
+      .catch(err => console.error('Failed to create canvas session:', err));
+  }, []);
   // Panning Support
   const handlePointerDown = (e: React.PointerEvent) => {
     // Only pan on left click background
@@ -141,146 +151,95 @@ export default function App() {
     }));
   }, []);
 
-  const generateNode = useCallback(async (prompt: string, x: number, y: number, parentId?: string, isRegenerationOf?: string) => {
-    const id = isRegenerationOf || `node-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    
-    // Create new node or update existing to 'generating'
-    if (isRegenerationOf) {
-      setNodes(prev => prev.map(n => n.id === id ? { ...n, status: 'generating' } : n));
-    } else {
-      const newNode: GridNodeData = {
-        id, x, y,
-        width: NODE_WIDTH,
-        prompt,
-        text: '',
-        prompts: [],
-        status: 'generating',
-        versionIndex: 0,
-        versions: [],
-        parentId
-      };
-      setNodes(prev => [...prev, newNode]);
+  // --- Node operations — all domain logic lives in the backend ---
+
+  const generateNode = useCallback(async (prompt: string, parentId?: string) => {
+    // Optimistic placeholder so the user sees immediate feedback.
+    let estX = 0, estY = 0;
+    if (parentId) {
+      const parent = nodesRef.current.find(n => n.id === parentId);
+      if (parent) { estX = parent.x + parent.width + 400; estY = parent.y; }
     }
-    
-    // Center view locally
-    setTimeout(() => centerOnPosition(x, y), 50);
+    const tempId = `temp-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const placeholder: GridNodeData = {
+      id: tempId, x: estX, y: estY, width: NODE_WIDTH,
+      prompt, text: '', prompts: [],
+      status: 'generating', versionIndex: 0, versions: [], parentId,
+    };
+    setNodes(prev => [...prev, placeholder]);
+    setTimeout(() => centerOnPosition(estX, estY), 50);
 
     try {
-      // 1. Fetch text
-      const res = await fetch('/api/generate', {
+      const res = await fetch(`/api/canvas/${canvasIdRef.current}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, parentId }),
       });
       const data = await res.json();
-      
       if (data.error) throw new Error(data.error);
-
-      setNodes(prev => prev.map(node => {
-        if (node.id === id) {
-          const newVersion = {
-            prompt,
-            text: data.text || 'No text',
-            prompts: data.prompts || [],
-          };
-          
-          return {
-            ...node,
-            status: 'ready',
-            versions: isRegenerationOf ? [...node.versions, newVersion] : [newVersion],
-            versionIndex: isRegenerationOf ? node.versions.length : 0,
-            text: newVersion.text,
-            prompts: newVersion.prompts,
-          };
-        }
-        return node;
-      }));
-
+      // Replace placeholder with the real backend node (correct position + content).
+      setNodes(prev => prev.map(n => n.id === tempId ? data.node : n));
+      centerOnPosition(data.node.x, data.node.y);
     } catch (error) {
       console.error(error);
-      setNodes(prev => prev.map(node => node.id === id ? { ...node, status: 'error' } : node));
+      setNodes(prev => prev.map(n => n.id === tempId ? { ...n, status: 'error' } : n));
     }
   }, [centerOnPosition]);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!searchQuery.trim()) return;
-
-    generateNode(searchQuery, 0, 0);
+    generateNode(searchQuery);
     setSearchQuery('');
   };
 
   const handleMagicWand = () => {
     const ideas = ["Evolution of Video Games", "Quantum Entanglement", "Rise of the Roman Empire", "History of Artificial Intelligence", "Deep Sea Ecosystems"];
-    generateNode(ideas[Math.floor(Math.random() * ideas.length)], 0, 0);
+    generateNode(ideas[Math.floor(Math.random() * ideas.length)]);
   };
 
   const handleExpand = useCallback((prompt: string, parentId: string) => {
-    const parent = nodesRef.current.find(n => n.id === parentId);
-    if (!parent) return;
-    
-    // Spawn to the right
-    const newX = parent.x + parent.width + 400; // 400px gap for prompts and connections
-    
-    // Add initial offset so the line is never perfectly straight
-    const initialOffset = Math.random() > 0.5 ? 200 : -200;
-    let newY = parent.y + initialOffset;
-    const cardWidth = parent.width;
-    const cardHeight = parent.height || 400;
-    
-    let isOccupied = true;
-    let offsetMultiplier = 1;
-    let direction = Math.random() > 0.5 ? 1 : -1; // 1 for down, -1 for up
-    
-    // AABB overlap detection using measured card dimensions
-    while (isOccupied) {
-      isOccupied = nodesRef.current.some(n => {
-        const nH = n.height || 400;
-        const xOverlap = Math.abs((n.x + cardWidth / 2) - (newX + cardWidth / 2)) < cardWidth;
-        const yOverlap = Math.abs((n.y + nH / 2) - (newY + cardHeight / 2)) < (nH + cardHeight) / 2;
-        return xOverlap && yOverlap;
-      });
-      
-      if (isOccupied) {
-        newY = parent.y + initialOffset + (cardHeight * offsetMultiplier * direction);
-        direction *= -1;
-        if (direction === 1) {
-          offsetMultiplier++;
-        }
-      }
-    }
-    
-    generateNode(prompt, newX, newY, parentId);
+    generateNode(prompt, parentId);
   }, [generateNode]);
 
-  const handleRegenerate = useCallback((nodeId: string) => {
-    const node = nodesRef.current.find(n => n.id === nodeId);
-    if (node) {
-      generateNode(node.prompt, node.x, node.y, node.parentId, nodeId);
+  const handleRegenerate = useCallback(async (nodeId: string) => {
+    setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, status: 'generating' } : n));
+    try {
+      const res = await fetch(`/api/canvas/${canvasIdRef.current}/nodes/${nodeId}/regenerate`, { method: 'POST' });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setNodes(prev => prev.map(n => n.id === nodeId ? data.node : n));
+    } catch (error) {
+      console.error(error);
+      setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, status: 'error' } : n));
     }
-  }, [generateNode]);
+  }, []);
 
-  const handleDelete = useCallback((nodeId: string) => {
-    // Delete this node and all descendants
-    const getDescendants = (id: string, allNodes: GridNodeData[]): string[] => {
-      const children = allNodes.filter(n => n.parentId === id).map(n => n.id);
-      let desc = [...children];
-      for (const childId of children) {
-        desc = [...desc, ...getDescendants(childId, allNodes)];
-      }
-      return desc;
-    };
-    
-    const toDelete = [nodeId, ...getDescendants(nodeId, nodesRef.current)];
-    setNodes(prev => prev.filter(n => !toDelete.includes(n.id)));
+  const handleDelete = useCallback(async (nodeId: string) => {
+    try {
+      const res = await fetch(`/api/canvas/${canvasIdRef.current}/nodes/${nodeId}`, { method: 'DELETE' });
+      const data = await res.json();
+      const deleteSet = new Set<string>(data.deletedIds);
+      setNodes(prev => prev.filter(n => !deleteSet.has(n.id)));
+    } catch (error) { console.error(error); }
   }, []);
 
   const setVersion = useCallback((nodeId: string, versionIndex: number) => {
     setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, versionIndex } : n));
+    fetch(`/api/canvas/${canvasIdRef.current}/nodes/${nodeId}/version`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ versionIndex }),
+    }).catch(() => {});
   }, []);
 
   const handleMeasure = useCallback((nodeId: string, height: number) => {
     setNodes(prev => prev.map(n => (n.id === nodeId && n.height !== height) ? { ...n, height } : n));
+    fetch(`/api/canvas/${canvasIdRef.current}/nodes/${nodeId}/measure`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ height }),
+    }).catch(() => {});
   }, []);
   
   const totalChars = nodes.reduce((acc, node) => acc + ((node.versions[node.versionIndex]?.text?.length) || 0), 0);

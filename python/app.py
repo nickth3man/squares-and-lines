@@ -1,31 +1,38 @@
 """
-Gridscape backend — Python (Flask)
+Gridscape backend — Python (Flask) with stateful canvas management.
 
-Serves the built frontend from ../frontend/dist and exposes
-POST /api/generate which calls an OpenAI-compatible chat completions
-endpoint and parses the markdown response into {text, prompts}.
+The backend owns all domain logic: node model, spatial layout (collision-aware
+child placement), versioning, tree structure, and deletion cascades.
+The frontend is a thin renderer that calls these REST endpoints.
 
-Run:  python app.py          (after: pip install -r requirements.txt)
+Run:  python app.py   (after: pip install -r requirements.txt)
 """
 
 import os
 import re
 import json
-import requests
+import random
+import time
+import threading
+import uuid
 from pathlib import Path
-from dotenv import load_dotenv
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+import requests
 from flask import Flask, request, jsonify, send_from_directory
 from collections import defaultdict, deque
-import threading
-import time
+
+from dotenv import load_dotenv
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Constants
 # ---------------------------------------------------------------------------
 
 MAX_PROMPT_LENGTH = 2000
+NODE_WIDTH = 400
 
 SYSTEM_PROMPT = (
     "You are an infinite spatial-knowledge-engine generator. "
@@ -43,9 +50,16 @@ SYSTEM_PROMPT = (
 HEADING_RE = re.compile(r"^##\s+explore further\s*$", re.IGNORECASE | re.MULTILINE)
 BULLET_RE = re.compile(r"^\s*[-*]\s+\[([^\]]+)\]\([^)]*\)\s*$", re.MULTILINE)
 
+CSP_HEADER = (
+    "default-src 'self'; script-src 'self'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com data:; "
+    "img-src 'self' data:; connect-src 'self'"
+)
+
 
 # ---------------------------------------------------------------------------
-# Markdown parser  (mirrors providers/contract.ts:parseMarkdownContent)
+# Markdown parser
 # ---------------------------------------------------------------------------
 
 def parse_markdown_content(raw: str) -> dict:
@@ -53,7 +67,6 @@ def parse_markdown_content(raw: str) -> dict:
     match = HEADING_RE.search(trimmed)
     if not match:
         return {"text": trimmed, "prompts": []}
-
     text = trimmed[: match.start()].strip()
     section = trimmed[match.start() + len(match.group(0)) :]
     prompts = [m.group(1).strip() for m in BULLET_RE.finditer(section)][:3]
@@ -61,7 +74,7 @@ def parse_markdown_content(raw: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# LLM provider  (OpenAI-compatible chat completions)
+# LLM provider
 # ---------------------------------------------------------------------------
 
 PROVIDERS = {
@@ -80,61 +93,215 @@ PROVIDERS = {
 }
 
 
-def call_chat_completions(base_url: str, api_key: str, model: str, prompt: str) -> dict:
+def call_chat_completions(base_url, api_key, model, prompt):
     resp = requests.post(
         f"{base_url}/chat/completions",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-        },
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        json={"model": model, "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]},
         timeout=60,
     )
     if not resp.ok:
         print(f"Chat completions error: {resp.status_code} {resp.text}")
-        raise ProviderError(
-            resp.status_code,
-            "LLM provider error. Check API key and account credits.",
-        )
-
+        raise ProviderError(resp.status_code, "LLM provider error")
     data = resp.json()
     content = ""
     choices = data.get("choices") or []
     if choices:
         message = choices[0].get("message") or {}
         content = message.get("content") or ""
-
     return parse_markdown_content(content)
 
 
-def generate_text(prompt: str) -> dict:
+def generate_text(prompt):
     name = os.environ.get("AI_PROVIDER", "openrouter").lower()
     cfg = PROVIDERS.get(name)
     if not cfg:
         raise ValueError(f'Unknown AI_PROVIDER "{name}"')
-
     return call_chat_completions(
-        base_url=cfg["base_url"],
-        api_key=os.environ.get(cfg["api_key_env"], ""),
-        model=os.environ.get(cfg["model_env"], cfg["default_model"]),
-        prompt=prompt,
+        cfg["base_url"],
+        os.environ.get(cfg["api_key_env"], ""),
+        os.environ.get(cfg["model_env"], cfg["default_model"]),
+        prompt,
     )
 
 
 class ProviderError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status, message):
         self.status = status
         super().__init__(message)
 
 
 # ---------------------------------------------------------------------------
-# Simple in-memory rate limiter (20 req/min per IP)
+# Canvas domain model (backend-owned)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NodeVersion:
+    prompt: str
+    text: str
+    prompts: list
+
+
+@dataclass
+class GridNodeData:
+    id: str
+    x: float
+    y: float
+    width: int = NODE_WIDTH
+    height: Optional[float] = None
+    prompt: str = ""
+    text: str = ""
+    prompts: list = field(default_factory=list)
+    status: str = "generating"
+    versionIndex: int = 0
+    versions: list = field(default_factory=list)
+    parentId: Optional[str] = None
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class Canvas:
+    id: str
+    nodes: list = field(default_factory=list)
+
+
+# In-memory canvas store
+_canvases: dict[str, Canvas] = {}
+_canvas_lock = threading.Lock()
+
+
+def create_canvas() -> Canvas:
+    cid = f"canvas-{int(time.time() * 1000)}-{random.randint(0, 99999)}"
+    canvas = Canvas(id=cid)
+    _canvases[cid] = canvas
+    return canvas
+
+
+def get_canvas(cid: str) -> Optional[Canvas]:
+    return _canvases.get(cid)
+
+
+def _gen_node_id() -> str:
+    return f"node-{int(time.time() * 1000)}-{random.randint(0, 999)}"
+
+
+# ---------------------------------------------------------------------------
+# Spatial layout — collision-aware child placement
+# (Exact replication of App.tsx handleExpand algorithm)
+# ---------------------------------------------------------------------------
+
+def compute_child_position(parent: GridNodeData, nodes: list) -> tuple:
+    new_x = parent.x + parent.width + 400
+    initial_offset = 200 if random.random() > 0.5 else -200
+    new_y = parent.y + initial_offset
+    card_height = parent.height or 400
+
+    occupied = True
+    offset_mult = 1
+    direction = 1 if random.random() > 0.5 else -1
+
+    while occupied:
+        occupied = any(
+            abs(n.x + NODE_WIDTH / 2 - (new_x + NODE_WIDTH / 2)) < NODE_WIDTH
+            and abs((n.y + (n.height or 400) / 2) - (new_y + card_height / 2))
+            < ((n.height or 400) + card_height) / 2
+            for n in nodes
+        )
+        if occupied:
+            new_y = parent.y + initial_offset + card_height * offset_mult * direction
+            direction *= -1
+            if direction == 1:
+                offset_mult += 1
+
+    return new_x, new_y
+
+
+# ---------------------------------------------------------------------------
+# Node operations
+# ---------------------------------------------------------------------------
+
+def canvas_generate_node(canvas: Canvas, prompt: str, parent_id: str = None) -> GridNodeData:
+    x, y = 0.0, 0.0
+    if parent_id:
+        parent = next((n for n in canvas.nodes if n.id == parent_id), None)
+        if not parent:
+            raise ValueError(f"Parent node {parent_id} not found")
+        x, y = compute_child_position(parent, canvas.nodes)
+
+    node = GridNodeData(id=_gen_node_id(), x=x, y=y, prompt=prompt, parentId=parent_id)
+    canvas.nodes.append(node)
+
+    try:
+        result = generate_text(prompt)
+        node.text = result["text"] or "No text"
+        node.prompts = result["prompts"]
+        node.status = "ready"
+        node.versions = [NodeVersion(prompt=prompt, text=node.text, prompts=node.prompts)]
+    except Exception as e:
+        print(f"Generate error: {e}")
+        node.status = "error"
+
+    return node
+
+
+def canvas_regenerate_node(canvas: Canvas, node_id: str) -> GridNodeData:
+    node = next((n for n in canvas.nodes if n.id == node_id), None)
+    if not node:
+        raise ValueError(f"Node {node_id} not found")
+
+    node.status = "generating"
+    try:
+        result = generate_text(node.prompt)
+        nv = NodeVersion(prompt=node.prompt, text=result["text"] or "No text", prompts=result["prompts"])
+        node.versions.append(nv)
+        node.versionIndex = len(node.versions) - 1
+        node.text = nv.text
+        node.prompts = nv.prompts
+        node.status = "ready"
+    except Exception as e:
+        print(f"Regenerate error: {e}")
+        node.status = "error"
+    return node
+
+
+def canvas_delete_node(canvas: Canvas, node_id: str) -> list:
+    def get_descendants(nid):
+        children = [n.id for n in canvas.nodes if n.parentId == nid]
+        desc = list(children)
+        for cid in children:
+            desc.extend(get_descendants(cid))
+        return desc
+
+    to_delete = {node_id, *get_descendants(node_id)}
+    canvas.nodes = [n for n in canvas.nodes if n.id not in to_delete]
+    return list(to_delete)
+
+
+def canvas_set_version(canvas: Canvas, node_id: str, version_index: int) -> GridNodeData:
+    node = next((n for n in canvas.nodes if n.id == node_id), None)
+    if not node:
+        raise ValueError(f"Node {node_id} not found")
+    node.versionIndex = version_index
+    if version_index < len(node.versions):
+        v = node.versions[version_index]
+        node.text = v.text
+        node.prompts = v.prompts
+    return node
+
+
+def canvas_measure_node(canvas: Canvas, node_id: str, height: float):
+    node = next((n for n in canvas.nodes if n.id == node_id), None)
+    if node:
+        node.height = height
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (20 req/min per IP)
 # ---------------------------------------------------------------------------
 
 _rate_log: dict[str, deque] = defaultdict(deque)
@@ -154,20 +321,11 @@ def rate_limited(ip: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# App
+# Flask app
 # ---------------------------------------------------------------------------
+
 app = Flask(__name__, static_folder=None)
-
 DIST_PATH = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-
-CSP_HEADER = (
-    "default-src 'self'; "
-    "script-src 'self'; "
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-    "font-src 'self' https://fonts.gstatic.com data:; "
-    "img-src 'self' data:; "
-    "connect-src 'self'"
-)
 
 
 @app.after_request
@@ -176,26 +334,87 @@ def set_csp(response):
     return response
 
 
-@app.post("/api/generate")
-def api_generate():
-    client_ip = request.remote_addr or "unknown"
-    if rate_limited(client_ip):
-        return jsonify({"error": "Too many requests. Please slow down."}), 429
+@app.post("/api/canvas")
+def api_create_canvas():
+    canvas = create_canvas()
+    return jsonify({"canvasId": canvas.id})
 
+
+@app.post("/api/canvas/<cid>/generate")
+def api_generate(cid):
+    canvas = get_canvas(cid)
+    if not canvas:
+        return jsonify({"error": "Canvas not found"}), 404
+    if rate_limited(request.remote_addr or "unknown"):
+        return jsonify({"error": "Too many requests. Please slow down."}), 429
     body = request.get_json(silent=True) or {}
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return jsonify({"error": "Prompt is required"}), 400
     if len(prompt) > MAX_PROMPT_LENGTH:
         return jsonify({"error": f"Prompt is too long (max {MAX_PROMPT_LENGTH} characters)."}), 400
-
     try:
-        return jsonify(generate_text(prompt))
+        node = canvas_generate_node(canvas, prompt, body.get("parentId"))
+        return jsonify({"node": node.to_dict()})
     except ProviderError as e:
         return jsonify({"error": "Generation failed. Please try again."}), e.status
-    except Exception as exc:
-        print(f"Generate error: {exc}")
+    except Exception as e:
+        print(f"Generate error: {e}")
         return jsonify({"error": "Failed to generate text content."}), 500
+
+
+@app.post("/api/canvas/<cid>/nodes/<nid>/regenerate")
+def api_regenerate(cid, nid):
+    canvas = get_canvas(cid)
+    if not canvas:
+        return jsonify({"error": "Canvas not found"}), 404
+    if rate_limited(request.remote_addr or "unknown"):
+        return jsonify({"error": "Too many requests. Please slow down."}), 429
+    try:
+        node = canvas_regenerate_node(canvas, nid)
+        return jsonify({"node": node.to_dict()})
+    except ValueError:
+        return jsonify({"error": "Node not found"}), 404
+
+
+@app.delete("/api/canvas/<cid>/nodes/<nid>")
+def api_delete(cid, nid):
+    canvas = get_canvas(cid)
+    if not canvas:
+        return jsonify({"error": "Canvas not found"}), 404
+    deleted = canvas_delete_node(canvas, nid)
+    return jsonify({"deletedIds": deleted})
+
+
+@app.put("/api/canvas/<cid>/nodes/<nid>/version")
+def api_version(cid, nid):
+    canvas = get_canvas(cid)
+    if not canvas:
+        return jsonify({"error": "Canvas not found"}), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        node = canvas_set_version(canvas, nid, body.get("versionIndex", 0))
+        return jsonify({"node": node.to_dict()})
+    except ValueError:
+        return jsonify({"error": "Node not found"}), 404
+
+
+@app.put("/api/canvas/<cid>/nodes/<nid>/measure")
+def api_measure(cid, nid):
+    canvas = get_canvas(cid)
+    if not canvas:
+        return jsonify({"error": "Canvas not found"}), 404
+    body = request.get_json(silent=True) or {}
+    canvas_measure_node(canvas, nid, body.get("height", 0))
+    return jsonify({"ok": True})
+
+
+@app.get("/api/canvas/<cid>/nodes")
+def api_get_nodes(cid):
+    canvas = get_canvas(cid)
+    if not canvas:
+        return jsonify({"error": "Canvas not found"}), 404
+    return jsonify({"nodes": [n.to_dict() for n in canvas.nodes]})
 
 
 # Static file serving + SPA fallback

@@ -4,7 +4,15 @@ import { fileURLToPath } from "url";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
-import { createProvider, ProviderError } from "./providers";
+import {
+  createCanvas,
+  getCanvas,
+  generateNode,
+  regenerateNode,
+  deleteNode,
+  setNodeVersion,
+  measureNode,
+} from "./canvas";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,13 +21,34 @@ dotenv.config();
 
 const MAX_PROMPT_LENGTH = 2000;
 
+// Helper: validate canvas exists
+function requireCanvas(req: express.Request, res: express.Response) {
+  const canvas = getCanvas(req.params.id);
+  if (!canvas) {
+    res.status(404).json({ error: "Canvas not found" });
+    return null;
+  }
+  return canvas;
+}
+
+// Helper: validate prompt
+function validatePrompt(body: any, res: express.Response): string | null {
+  const { prompt } = body;
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    res.status(400).json({ error: "Prompt is required" });
+    return null;
+  }
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    res.status(400).json({ error: `Prompt is too long (max ${MAX_PROMPT_LENGTH} characters).` });
+    return null;
+  }
+  return prompt;
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  // Security headers (production only). In dev, Vite injects inline scripts
-  // for HMR/Fast Refresh that a strict CSP would block, so helmet is skipped
-  // on localhost. CSP allows the Google Fonts in index.css and inline styles.
   if (process.env.NODE_ENV === "production") {
     app.use(
       helmet({
@@ -39,39 +68,84 @@ async function startServer() {
 
   app.use(express.json({ limit: "1mb" }));
 
-  const provider = createProvider();
-
-  // Cap costly LLM calls per IP to protect the provider budget.
+  // Rate-limit only endpoints that trigger LLM calls.
   const generateLimiter = rateLimit({
-    windowMs: 60 * 1000, // 1 minute
-    limit: 20, // max 20 requests per minute per IP
+    windowMs: 60 * 1000,
+    limit: 20,
     standardHeaders: "draft-7",
     legacyHeaders: false,
     message: { error: "Too many requests. Please slow down." },
   });
 
-  app.post("/api/generate", generateLimiter, async (req, res) => {
-    try {
-      const { prompt } = req.body;
-      if (typeof prompt !== "string" || !prompt.trim()) {
-        return res.status(400).json({ error: "Prompt is required" });
-      }
-      if (prompt.length > MAX_PROMPT_LENGTH) {
-        return res.status(400).json({
-          error: `Prompt is too long (max ${MAX_PROMPT_LENGTH} characters).`,
-        });
-      }
+  // POST /api/canvas — create a new canvas session
+  app.post("/api/canvas", (_req, res) => {
+    const canvas = createCanvas();
+    res.json({ canvasId: canvas.id });
+  });
 
-      res.json(await provider.generateText(prompt));
+  // POST /api/canvas/:id/generate — create a root or child node
+  app.post("/api/canvas/:id/generate", generateLimiter, async (req, res) => {
+    const canvas = requireCanvas(req, res);
+    if (!canvas) return;
+    const prompt = validatePrompt(req.body, res);
+    if (!prompt) return;
+    const { parentId } = req.body;
+    try {
+      const node = await generateNode(canvas, prompt, parentId);
+      res.json({ node });
     } catch (error) {
       console.error(error);
-      if (error instanceof ProviderError) {
-        // Send a generic message to the client; the details are logged above.
-        res.status(error.status).json({ error: "Generation failed. Please try again." });
-      } else {
-        res.status(500).json({ error: "Failed to generate text content." });
-      }
+      res.status(500).json({ error: "Failed to generate text content." });
     }
+  });
+
+  // POST /api/canvas/:id/nodes/:nid/regenerate — add a new version
+  app.post("/api/canvas/:id/nodes/:nid/regenerate", generateLimiter, async (req, res) => {
+    const canvas = requireCanvas(req, res);
+    if (!canvas) return;
+    try {
+      const node = await regenerateNode(canvas, req.params.nid);
+      res.json({ node });
+    } catch (error) {
+      console.error(error);
+      res.status(404).json({ error: "Node not found" });
+    }
+  });
+
+  // DELETE /api/canvas/:id/nodes/:nid — delete node + descendants
+  app.delete("/api/canvas/:id/nodes/:nid", (req, res) => {
+    const canvas = requireCanvas(req, res);
+    if (!canvas) return;
+    const deletedIds = deleteNode(canvas, req.params.nid);
+    res.json({ deletedIds });
+  });
+
+  // PUT /api/canvas/:id/nodes/:nid/version — switch active version
+  app.put("/api/canvas/:id/nodes/:nid/version", (req, res) => {
+    const canvas = requireCanvas(req, res);
+    if (!canvas) return;
+    const { versionIndex } = req.body;
+    try {
+      const node = setNodeVersion(canvas, req.params.nid, versionIndex);
+      res.json({ node });
+    } catch {
+      res.status(404).json({ error: "Node not found" });
+    }
+  });
+
+  // PUT /api/canvas/:id/nodes/:nid/measure — update measured height
+  app.put("/api/canvas/:id/nodes/:nid/measure", (req, res) => {
+    const canvas = requireCanvas(req, res);
+    if (!canvas) return;
+    measureNode(canvas, req.params.nid, req.body.height);
+    res.json({ ok: true });
+  });
+
+  // GET /api/canvas/:id/nodes — get all nodes
+  app.get("/api/canvas/:id/nodes", (req, res) => {
+    const canvas = requireCanvas(req, res);
+    if (!canvas) return;
+    res.json({ nodes: canvas.nodes });
   });
 
   // Serve the built frontend (../frontend/dist). The frontend is a separate
