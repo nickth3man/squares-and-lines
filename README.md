@@ -4,15 +4,11 @@ An infinite spatial canvas for exploring interconnected concepts with AI-generat
 
 ## Architecture
 
-The frontend and backend are **fully decoupled**. The frontend is a React 19 SPA (shared across all backends); the backend serves static files + a single API endpoint.
-
-```
-POST /api/generate   { "prompt": "string" }   →   { "text": "string", "prompts": ["string", ...] }
-```
+The frontend and backend are **fully decoupled**. The frontend is a React 19 SPA (thin renderer); each backend owns **all domain logic** — the node model, spatial layout (collision-aware child placement), versioning, tree structure, and deletion cascades — and maintains the canvas state in memory.
 
 ```
 gridscape/
-├── frontend/          Shared React SPA (Vite + Tailwind v4)
+├── frontend/          Shared React SPA (thin renderer, Vite + Tailwind v4)
 │   └── dist/          Built output — served by every backend
 ├── typescript/        Express backend (original reference impl)
 ├── python/            Flask backend
@@ -22,12 +18,38 @@ gridscape/
 └── c/                 raw sockets + libcurl backend
 ```
 
-Each backend implements the **exact same contract**:
+## API — Stateful Canvas Sessions
 
-1. Serve static files from `../frontend/dist` with SPA fallback to `index.html`.
-2. `POST /api/generate` — validate the prompt, call an OpenAI-compatible chat completions endpoint, parse the markdown response into `{ text, prompts }`.
-3. Rate limiting (20 requests/min/IP) to protect the LLM budget.
-4. Same env vars across all backends.
+Every backend implements the **exact same contract**. The frontend creates a canvas session, then calls REST endpoints for every node operation. The backend returns complete `GridNodeData` objects:
+
+```json
+{
+  "id": "node-...",
+  "x": 800, "y": 200, "width": 400, "height": 400,
+  "prompt": "event horizon",
+  "text": "...markdown with [Term](Term) links...",
+  "prompts": ["follow-up 1", "follow-up 2", "follow-up 3"],
+  "status": "ready",
+  "versionIndex": 1,
+  "versions": [{ "prompt": "...", "text": "...", "prompts": ["..."] }],
+  "parentId": "node-..."
+}
+```
+
+| Method | Endpoint | Body | Returns |
+|---|---|---|---|
+| `POST` | `/api/canvas` | — | `{ canvasId }` |
+| `POST` | `/api/canvas/:id/generate` | `{ prompt, parentId? }` | `{ node }` |
+| `POST` | `/api/canvas/:id/nodes/:nid/regenerate` | — | `{ node }` |
+| `DELETE` | `/api/canvas/:id/nodes/:nid` | — | `{ deletedIds: [...] }` |
+| `PUT` | `/api/canvas/:id/nodes/:nid/version` | `{ versionIndex }` | `{ node }` |
+| `PUT` | `/api/canvas/:id/nodes/:nid/measure` | `{ height }` | `{ ok: true }` |
+| `GET` | `/api/canvas/:id/nodes` | — | `{ nodes: [...] }` |
+
+- `generate` without `parentId` creates a root node at (0, 0); with `parentId` it places a collision-free child to the right of the parent.
+- `regenerate` adds a new version to the node and switches to it.
+- `delete` removes the node **and all its descendants** (cascade).
+- `measure` records the rendered height so collision avoidance uses real dimensions.
 
 The LLM contract is **JSON-free by design** — the model returns plain markdown with `[Term](Term)` links and a trailing `## Explore further` section. `parseMarkdownContent` splits these deterministically. Works with any model, including small/free ones that reject structured outputs.
 

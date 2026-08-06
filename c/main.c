@@ -616,9 +616,23 @@ static void handle_get_nodes(SOCKET client, Canvas *canvas) {
 
 static void handle_request(SOCKET client, const char *dist_path) {
     char *buf = malloc(BUFSZ);
-    int received = recv(client, buf, BUFSZ - 1, 0);
-    if (received <= 0) { free(buf); return; }
-    buf[received] = '\0';
+    int total = 0;
+    /* Loop recv until we have full headers + body (based on Content-Length) */
+    while (total < BUFSZ - 1) {
+        int n = recv(client, buf + total, BUFSZ - 1 - total, 0);
+        if (n <= 0) break;
+        total += n;
+        buf[total] = '\0';
+        char *hdr_end = strstr(buf, "\r\n\r\n");
+        if (!hdr_end) continue;
+        int hdr_len = (int)(hdr_end - buf) + 4;
+        int cl = 0;
+        char *p = strstr(buf, "Content-Length:");
+        if (p) cl = atoi(p + 15);
+        if (total >= hdr_len + cl) break;
+    }
+    if (total <= 0) { free(buf); return; }
+    buf[total] = '\0';
 
     char method[16], path[1024];
     method[0] = path[0] = '\0';
@@ -630,7 +644,7 @@ static void handle_request(SOCKET client, const char *dist_path) {
     if (strncmp(path, "/api/canvas", 11) == 0) {
         /* Special case: GET /api/canvas/:cid/nodes */
         char segs[8][128]; int nseg = parse_path_segs(path, segs, 8);
-        if (strcmp(method, "GET")==0 && nseg==5 && strcmp(segs[3],"nodes")==0) {
+        if (strcmp(method, "GET")==0 && nseg==4 && strcmp(segs[3],"nodes")==0) {
             Canvas *c = find_canvas(segs[2]);
             if (c) handle_get_nodes(client, c);
             else send_error(client, 404, "Canvas not found");

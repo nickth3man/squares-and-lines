@@ -1,7 +1,7 @@
 # Gridscape — C++ Backend
 
-Serves the Gridscape frontend and proxies LLM text generation via an
-OpenAI-compatible chat completions API. Built with **cpp-httplib** (server)
+Stateful canvas backend: owns the node model, spatial layout, versioning,
+tree structure, and deletion cascades. Built with **cpp-httplib** (server)
 and **libcurl** (outbound HTTPS).
 
 ## Prerequisites
@@ -40,6 +40,20 @@ Set environment variables before running (copy from `../typescript/.env.example`
 | `OPENAI_API_KEY` | — | Required for the OpenAI provider |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model id on OpenAI |
 | `PORT` | `3000` | Server port |
+
+## API
+
+Stateful canvas sessions (same contract as every backend):
+
+| Method | Endpoint | Body | Returns |
+|---|---|---|---|
+| `POST` | `/api/canvas` | — | `{ canvasId }` |
+| `POST` | `/api/canvas/:id/generate` | `{ prompt, parentId? }` | `{ node }` |
+| `POST` | `/api/canvas/:id/nodes/:nid/regenerate` | — | `{ node }` |
+| `DELETE` | `/api/canvas/:id/nodes/:nid` | — | `{ deletedIds }` |
+| `PUT` | `/api/canvas/:id/nodes/:nid/version` | `{ versionIndex }` | `{ node }` |
+| `PUT` | `/api/canvas/:id/nodes/:nid/measure` | `{ height }` | `{ ok: true }` |
+| `GET` | `/api/canvas/:id/nodes` | — | `{ nodes }` |
 
 ## Dev workflow
 
