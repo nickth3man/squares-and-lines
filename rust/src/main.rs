@@ -36,6 +36,7 @@ static HEADING_RE: LazyLock<Regex> =
 static BULLET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*[-*]\s+\[([^\]]+)\]\([^)]*\)\s*$").unwrap());
 
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 fn now_millis() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
 }
@@ -99,7 +100,7 @@ async fn call_llm(prompt: &str) -> Result<GenResult, String> {
             {"role": "user", "content": prompt},
         ]
     });
-    let client = reqwest::Client::new();
+    let client = &*HTTP_CLIENT;
     let resp = client.post(format!("{}/chat/completions", cfg.base_url))
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&body).send().await.map_err(|e| e.to_string())?;
