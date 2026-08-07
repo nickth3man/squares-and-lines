@@ -21,6 +21,7 @@
 #include <regex>
 #include <string>
 #include <vector>
+#include <optional>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -134,7 +135,8 @@ struct RateLimiter {
 // Markdown parser
 // ---------------------------------------------------------------------------
 
-struct GenResult { std::string text; std::vector<std::string> prompts; };
+struct InlineLink { std::string label; std::string target; };
+struct GenResult { std::string text; std::vector<std::string> prompts; std::vector<InlineLink> links; };
 
 static GenResult parseMarkdownContent(const std::string& raw) {
     std::string trimmed = trim(raw);
@@ -144,24 +146,25 @@ static GenResult parseMarkdownContent(const std::string& raw) {
         size_t lineEnd = trimmed.find('\n', pos);
         std::string line = (lineEnd == std::string::npos) ? trimmed.substr(pos) : trimmed.substr(pos, lineEnd - pos);
         std::string stripped = trim(line);
-        if (stripped.size() > 3 && stripped.substr(0, 2) == "##") {
-            if (iequals(trim(stripped.substr(2)), "explore further")) {
-                headingPos = pos;
-                headingEnd = (lineEnd == std::string::npos) ? trimmed.size() : lineEnd + 1;
-                break;
-            }
+        if (stripped.size() > 3 && stripped.substr(0, 2) == "##" && iequals(trim(stripped.substr(2)), "explore further")) {
+            headingPos = pos;
+            headingEnd = (lineEnd == std::string::npos) ? trimmed.size() : lineEnd + 1;
+            break;
         }
         if (lineEnd == std::string::npos) break;
         pos = lineEnd + 1;
     }
-    if (headingPos == std::string::npos) return { trimmed, {} };
-    std::string text = trim(trimmed.substr(0, headingPos));
-    std::string section = trimmed.substr(headingEnd);
+    std::string text = headingPos == std::string::npos ? trimmed : trim(trimmed.substr(0, headingPos));
+    std::string section = headingPos == std::string::npos ? "" : trimmed.substr(headingEnd);
     std::vector<std::string> prompts;
     std::regex bulletRe(R"(^\s*[-*]\s+\[([^\]]+)\]\([^)]*\)\s*$)", std::regex::multiline);
     for (std::sregex_iterator it(section.begin(), section.end(), bulletRe), end; it != end && prompts.size() < 3; ++it)
         prompts.push_back(trim((*it)[1].str()));
-    return { text, prompts };
+    std::vector<InlineLink> links;
+    std::regex linkRe(R"(\[([^\]]+)\]\(([^)]+)\))");
+    for (std::sregex_iterator it(text.begin(), text.end(), linkRe), end; it != end; ++it)
+        links.push_back({trim((*it)[1].str()), trim((*it)[2].str())});
+    return {text, prompts, links};
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +218,11 @@ static bool callLLM(const std::string& prompt, GenResult& out) {
 // Canvas domain model
 // ---------------------------------------------------------------------------
 
-struct NodeVersion { std::string prompt, text; std::vector<std::string> prompts; };
+struct NodeVersion {
+    std::string prompt, text;
+    std::vector<std::string> prompts;
+    std::vector<InlineLink> links;
+};
 
 struct GridNodeData {
     std::string id;
@@ -223,19 +230,24 @@ struct GridNodeData {
     std::optional<double> height;
     std::string prompt, text, status;
     std::vector<std::string> prompts;
+    std::vector<InlineLink> links;
     int versionIndex;
     std::vector<NodeVersion> versions;
     std::string parentId;
 
     json toJson() const {
         json j = { {"id", id}, {"x", x}, {"y", y}, {"width", width},
-            {"prompt", prompt}, {"text", text}, {"prompts", prompts},
+            {"prompt", prompt}, {"text", text}, {"prompts", prompts}, {"links", json::array()},
             {"status", status}, {"versionIndex", versionIndex} };
+        for (const auto& link : links) j["links"].push_back({{"label", link.label}, {"target", link.target}});
         if (height) j["height"] = *height;
         if (!parentId.empty()) j["parentId"] = parentId;
         json vers = json::array();
-        for (auto& v : versions)
-            vers.push_back({{"prompt", v.prompt}, {"text", v.text}, {"prompts", v.prompts}});
+        for (const auto& version : versions) {
+            json item = {{"prompt", version.prompt}, {"text", version.text}, {"prompts", version.prompts}, {"links", json::array()}};
+            for (const auto& link : version.links) item["links"].push_back({{"label", link.label}, {"target", link.target}});
+            vers.push_back(item);
+        }
         j["versions"] = vers;
         return j;
     }
@@ -292,7 +304,7 @@ static std::string readFile(const fs::path& p) {
 // Main
 // ---------------------------------------------------------------------------
 
-int main() {
+static int server_main() {
     loadDotEnv();
     curl_global_init(CURL_GLOBAL_DEFAULT);
     int port = std::stoi(envOr("PORT", "3000"));
@@ -327,13 +339,13 @@ int main() {
             if (pit == canvas.nodes.end()) { res.status = 500; res.set_content(R"({"error":"Parent not found"})", "application/json"); return; }
             auto [px, py] = computeChildPosition(*pit, canvas.nodes); x = px; y = py;
         }
-        GridNodeData node{genId("node"), x, y, NODE_WIDTH, std::nullopt, prompt, "", "generating", {}, 0, {}, parentId};
+        GridNodeData node{genId("node"), x, y, NODE_WIDTH, std::nullopt, prompt, "", "generating", {}, {}, 0, {}, parentId};
         canvas.nodes.push_back(node);
         GenResult result;
         if (callLLM(prompt, result)) {
             node.text = result.text.empty() ? "No text" : result.text;
-            node.prompts = result.prompts; node.status = "ready";
-            node.versions.push_back({prompt, node.text, node.prompts});
+            node.prompts = result.prompts; node.links = result.links; node.status = "ready";
+            node.versions.push_back({prompt, node.text, node.prompts, node.links});
         } else { node.status = "error"; }
         auto& stored = canvas.nodes.back(); stored = node;
         res.set_content(json{{"node", node.toJson()}}.dump(), "application/json");
@@ -352,9 +364,9 @@ int main() {
         GenResult result;
         if (callLLM(node.prompt, result)) {
             std::string text = result.text.empty() ? "No text" : result.text;
-            node.versions.push_back({node.prompt, text, result.prompts});
+            node.versions.push_back({node.prompt, text, result.prompts, result.links});
             node.versionIndex = node.versions.size() - 1;
-            node.text = text; node.prompts = result.prompts; node.status = "ready";
+            node.text = text; node.prompts = result.prompts; node.links = result.links; node.status = "ready";
         } else { node.status = "error"; }
         res.set_content(json{{"node", node.toJson()}}.dump(), "application/json");
     });
@@ -389,8 +401,21 @@ int main() {
         json body = json::parse(req.body, nullptr, false);
         int vi = body.value("versionIndex", 0);
         auto& node = *nit; node.versionIndex = vi;
-        if (vi < (int)node.versions.size()) { node.text = node.versions[vi].text; node.prompts = node.versions[vi].prompts; }
+        if (vi >= 0 && vi < (int)node.versions.size()) { node.text = node.versions[vi].text; node.prompts = node.versions[vi].prompts; node.links = node.versions[vi].links; }
         res.set_content(json{{"node", node.toJson()}}.dump(), "application/json");
+    });
+
+    // PUT /api/canvas/:cid/nodes/:nid/position
+    svr.Put(R"(/api/canvas/([^/]+)/nodes/([^/]+)/position)", [](const auto& req, auto& res) {
+        std::lock_guard<std::mutex> lock(g_canvasMutex);
+        auto it = g_canvases.find(req.matches[1]);
+        if (it == g_canvases.end()) { res.status = 404; res.set_content(R"({"error":"Canvas not found"})", "application/json"); return; }
+        auto nit = std::find_if(it->second.nodes.begin(), it->second.nodes.end(), [&](const auto& n){ return n.id == req.matches[2]; });
+        if (nit == it->second.nodes.end()) { res.status = 404; res.set_content(R"({"error":"Node not found"})", "application/json"); return; }
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("x") || !body.contains("y") || !body["x"].is_number() || !body["y"].is_number()) { res.status = 400; res.set_content(R"({"error":"Position requires numeric x and y"})", "application/json"); return; }
+        nit->x = body["x"].get<double>(); nit->y = body["y"].get<double>();
+        res.set_content(json{{"node", nit->toJson()}}.dump(), "application/json");
     });
 
     // PUT /api/canvas/:cid/nodes/:nid/measure
@@ -429,3 +454,13 @@ int main() {
     curl_global_cleanup();
     return 0;
 }
+
+#ifdef GRIDSCAPE_CONTRACT_TEST
+int main() {
+    GenResult result = parseMarkdownContent("Text with [Term](Term).\n\n## Explore further\n\n- [Prompt](Prompt)");
+    if (result.text != "Text with [Term](Term)." || result.prompts.size() != 1 || result.prompts[0] != "Prompt" || result.links.size() != 1 || result.links[0].label != "Term" || result.links[0].target != "Term") return 1;
+    return 0;
+}
+#else
+int main() { return server_main(); }
+#endif

@@ -151,7 +151,31 @@ static char *parse_bullet(const char *line) {
     return trim(label);
 }
 
-typedef struct { char *text; char **prompts; int prompt_count; } GenResult;
+#define MAX_LINKS 16
+typedef struct { char *label; char *target; } InlineLink;
+typedef struct { char *text; char **prompts; int prompt_count; InlineLink *links; int link_count; } GenResult;
+
+static void extract_inline_links(const char *text, InlineLink **out_links, int *out_count) {
+    *out_links = calloc(MAX_LINKS, sizeof(InlineLink));
+    *out_count = 0;
+    const char *p = text;
+    while (*p && *out_count < MAX_LINKS) {
+        const char *start = strchr(p, '[');
+        if (!start) break;
+        const char *label_end = strchr(start + 1, ']');
+        if (!label_end || label_end[1] != '(') break;
+        const char *target_end = strchr(label_end + 2, ')');
+        if (!target_end) break;
+        size_t label_len = (size_t)(label_end - start - 1);
+        size_t target_len = (size_t)(target_end - label_end - 2);
+        (*out_links)[*out_count].label = malloc(label_len + 1);
+        (*out_links)[*out_count].target = malloc(target_len + 1);
+        memcpy((*out_links)[*out_count].label, start + 1, label_len); (*out_links)[*out_count].label[label_len] = '\0';
+        memcpy((*out_links)[*out_count].target, label_end + 2, target_len); (*out_links)[*out_count].target[target_len] = '\0';
+        (*out_count)++;
+        p = target_end + 1;
+    }
+}
 
 static GenResult parse_markdown_content(const char *raw) {
     GenResult r = {0};
@@ -163,7 +187,11 @@ static GenResult parse_markdown_content(const char *raw) {
         if (is_heading(ls)) { heading_start = ls; after_heading = nl ? nl+1 : ls+strlen(ls); if (nl) *nl = sv; break; }
         if (nl) *nl = sv; ls = nl ? nl+1 : NULL;
     }
-    if (!heading_start) { r.text = str_dup(trimmed); free(copy); return r; }
+    if (!heading_start) {
+        r.text = str_dup(trimmed);
+        extract_inline_links(r.text, &r.links, &r.link_count);
+        free(copy); return r;
+    }
     *heading_start = '\0'; r.text = str_dup(trim(trimmed));
     r.prompts = malloc(MAX_PROMPTS * sizeof(char*)); r.prompt_count = 0;
     char *line = after_heading;
@@ -172,12 +200,14 @@ static GenResult parse_markdown_content(const char *raw) {
         char *label = parse_bullet(line); if (label) r.prompts[r.prompt_count++] = label;
         if (nl) *nl = sv; line = nl ? nl+1 : NULL;
     }
+    extract_inline_links(r.text, &r.links, &r.link_count);
     free(copy); return r;
 }
 
 static void free_gen_result(GenResult *r) {
     free(r->text); for (int i = 0; i < r->prompt_count; i++) free(r->prompts[i]);
-    free(r->prompts);
+    for (int i = 0; i < r->link_count; i++) { free(r->links[i].label); free(r->links[i].target); }
+    free(r->prompts); free(r->links);
 }
 
 /* ---------------------------------------------------------------------------
@@ -245,14 +275,36 @@ static bool call_llm(const char *prompt, GenResult *out) {
  * Canvas domain model
  * ----------------------------------------------------------------------- */
 
-typedef struct { char *prompt, *text; char **prompts; int prompt_count; } NodeVer;
+typedef struct {
+    char *prompt, *text;
+    char **prompts; int prompt_count;
+    InlineLink *links; int link_count;
+} NodeVer;
 
 typedef struct {
     char id[64]; double x, y, width, height; char prompt[1024];
     char *text; char **prompts; int prompt_count;
+    InlineLink *links; int link_count;
     char status[16]; int versionIndex; NodeVer versions[MAX_VERSIONS]; int version_count;
     char parentId[64];
 } Node;
+
+static InlineLink *clone_links(const InlineLink *source, int count) {
+    if (count == 0) return NULL;
+    InlineLink *copy = calloc((size_t)count, sizeof(InlineLink));
+    for (int i = 0; i < count; i++) {
+        copy[i].label = str_dup(source[i].label);
+        copy[i].target = str_dup(source[i].target);
+    }
+    return copy;
+}
+static char **clone_prompts(char **source, int count) {
+    if (count == 0) return NULL;
+    char **copy = calloc((size_t)count, sizeof(char*));
+    for (int i = 0; i < count; i++) copy[i] = str_dup(source[i]);
+    return copy;
+}
+
 
 typedef struct { char id[64]; Node *nodes; int count, capacity; } Canvas;
 
@@ -308,31 +360,35 @@ static void compute_child_pos(Node *parent, Node *all, int count, double *ox, do
 
 /* Node JSON serialization */
 static char *node_to_json(Node *n) {
-    size_t sz = 256 + strlen(n->id) + strlen(n->prompt) + (n->text ? strlen(n->text) : 0) + n->prompt_count * 128;
+    size_t sz = 1024 + strlen(n->id) + strlen(n->prompt) + (n->text ? strlen(n->text) : 0) + n->prompt_count * 128 + n->link_count * 256;
     char *esc_text = json_escape(n->text ? n->text : "");
-    char *buf = malloc(sz + strlen(esc_text) + 4096);
-    int pos = snprintf(buf, sz + 4096,
+    char *buf = malloc(sz + 8192); int pos = snprintf(buf, sz + 8192,
         "{\"id\":\"%s\",\"x\":%.0f,\"y\":%.0f,\"width\":%.0f,\"height\":%.0f,\"prompt\":\"%s\",\"text\":\"%s\",\"prompts\":[",
         n->id, n->x, n->y, n->width, n->height, n->prompt, esc_text);
     free(esc_text);
-    for (int i = 0; i < n->prompt_count; i++) {
-        char *e = json_escape(n->prompts[i]);
-        pos += snprintf(buf+pos, sz+4096-pos, "%s\"%s\"", i>0?",":"", e); free(e);
+    for (int i = 0; i < n->prompt_count; i++) { char *e = json_escape(n->prompts[i]); pos += snprintf(buf+pos, sz+8192-pos, "%s\"%s\"", i ? "," : "", e); free(e); }
+    pos += snprintf(buf+pos, sz+8192-pos, "],\"links\":[");
+    for (int i = 0; i < n->link_count; i++) {
+        char *el = json_escape(n->links[i].label), *et = json_escape(n->links[i].target);
+        pos += snprintf(buf+pos, sz+8192-pos, "%s{\"label\":\"%s\",\"target\":\"%s\"}", i ? "," : "", el, et);
+        free(el); free(et);
     }
-    pos += snprintf(buf+pos, sz+4096-pos, "],\"status\":\"%s\",\"versionIndex\":%d,\"versions\":[", n->status, n->versionIndex);
+    pos += snprintf(buf+pos, sz+8192-pos, "],\"status\":\"%s\",\"versionIndex\":%d,\"versions\":[", n->status, n->versionIndex);
     for (int i = 0; i < n->version_count; i++) {
-        char *et = json_escape(n->versions[i].text ? n->versions[i].text : "");
-        pos += snprintf(buf+pos, sz+4096-pos, "%s{\"prompt\":\"%s\",\"text\":\"%s\",\"prompts\":[",
-            i>0?",":"", n->versions[i].prompt, et); free(et);
-        for (int j = 0; j < n->versions[i].prompt_count; j++) {
-            char *e = json_escape(n->versions[i].prompts[j]);
-            pos += snprintf(buf+pos, sz+4096-pos, "%s\"%s\"", j>0?",":"", e); free(e);
+        NodeVer *v = &n->versions[i]; char *ep = json_escape(v->prompt), *et = json_escape(v->text ? v->text : "");
+        pos += snprintf(buf+pos, sz+8192-pos, "%s{\"prompt\":\"%s\",\"text\":\"%s\",\"prompts\":[", i ? "," : "", ep, et); free(ep); free(et);
+        for (int j = 0; j < v->prompt_count; j++) { char *e = json_escape(v->prompts[j]); pos += snprintf(buf+pos, sz+8192-pos, "%s\"%s\"", j ? "," : "", e); free(e); }
+        pos += snprintf(buf+pos, sz+8192-pos, "],\"links\":[");
+        for (int j = 0; j < v->link_count; j++) {
+            char *el = json_escape(v->links[j].label), *etarget = json_escape(v->links[j].target);
+            pos += snprintf(buf+pos, sz+8192-pos, "%s{\"label\":\"%s\",\"target\":\"%s\"}", j ? "," : "", el, etarget);
+            free(el); free(etarget);
         }
-        pos += snprintf(buf+pos, sz+4096-pos, "]}");
+        pos += snprintf(buf+pos, sz+8192-pos, "]}");
     }
-    pos += snprintf(buf+pos, sz+4096-pos, "]"); 
-    if (n->parentId[0]) pos += snprintf(buf+pos, sz+4096-pos, ",\"parentId\":\"%s\"", n->parentId);
-    pos += snprintf(buf+pos, sz+4096-pos, "}");
+    pos += snprintf(buf+pos, sz+8192-pos, "]");
+    if (n->parentId[0]) pos += snprintf(buf+pos, sz+8192-pos, ",\"parentId\":\"%s\"", n->parentId);
+    snprintf(buf+pos, sz+8192-pos, "}");
     return buf;
 }
 
@@ -474,26 +530,25 @@ static void handle_api(SOCKET client, const char *method, const char *path, cons
         memset(node, 0, sizeof(Node));
         gen_id(node->id, sizeof(node->id), "node");
         node->width = NODE_WIDTH; node->height = 0;
-        strncpy(node->prompt, prompt, sizeof(node->prompt)-1);
-        strcpy(node->status, "generating"); node->versionIndex = 0;
         if (parentId && parentId[0]) { strncpy(node->parentId, parentId, sizeof(node->parentId)-1); }
-
         if (parentId && parentId[0]) {
             Node *parent = find_node(canvas, parentId);
-            if (parent) { compute_child_pos(parent, canvas->nodes, canvas->count, &node->x, &node->y); }
+            if (parent) compute_child_pos(parent, canvas->nodes, canvas->count, &node->x, &node->y);
         }
-
+        strcpy(node->status, "generating");
         GenResult gr;
         if (call_llm(prompt, &gr)) {
             node->text = gr.text[0] ? gr.text : str_dup("No text");
             node->prompts = gr.prompts; node->prompt_count = gr.prompt_count;
+            node->links = gr.links; node->link_count = gr.link_count;
             strcpy(node->status, "ready");
             if (node->version_count < MAX_VERSIONS) {
                 NodeVer *v = &node->versions[node->version_count++];
                 v->prompt = str_dup(prompt); v->text = str_dup(node->text);
-                v->prompts = gr.prompts; v->prompt_count = gr.prompt_count;
+                v->prompts = clone_prompts(gr.prompts, gr.prompt_count); v->prompt_count = gr.prompt_count;
+                v->links = clone_links(gr.links, gr.link_count); v->link_count = gr.link_count;
             }
-        } else { strcpy(node->status, "error"); node->text = str_dup(""); node->prompts = NULL; node->prompt_count = 0; }
+        } else { strcpy(node->status, "error"); node->text = str_dup(""); node->prompts = NULL; node->prompt_count = 0; node->links = NULL; node->link_count = 0; }
 
         char *json = node_to_json(node);
         char *wrap = malloc(strlen(json) + 16);
@@ -519,11 +574,13 @@ static void handle_api(SOCKET client, const char *method, const char *path, cons
             if (node->version_count < MAX_VERSIONS) {
                 NodeVer *v = &node->versions[node->version_count++];
                 v->prompt = str_dup(node->prompt); v->text = str_dup(text);
-                v->prompts = gr.prompts; v->prompt_count = gr.prompt_count;
+                v->prompts = clone_prompts(gr.prompts, gr.prompt_count); v->prompt_count = gr.prompt_count;
+                v->links = clone_links(gr.links, gr.link_count); v->link_count = gr.link_count;
             }
             node->versionIndex = node->version_count - 1;
             free(node->text); node->text = text;
             free(node->prompts); node->prompts = gr.prompts; node->prompt_count = gr.prompt_count;
+            free(node->links); node->links = gr.links; node->link_count = gr.link_count;
             strcpy(node->status, "ready");
         } else strcpy(node->status, "error");
         char *json = node_to_json(node);
@@ -581,10 +638,25 @@ static void handle_api(SOCKET client, const char *method, const char *path, cons
                 node->prompts = realloc(node->prompts, (node->prompt_count+1)*sizeof(char*));
                 node->prompts[node->prompt_count++] = str_dup(node->versions[vi].prompts[j]);
             }
+            free(node->links); node->links = clone_links(node->versions[vi].links, node->versions[vi].link_count);
+            node->link_count = node->versions[vi].link_count;
         }
         char *json = node_to_json(node);
         char *wrap = malloc(strlen(json)+16); sprintf(wrap, "{\"node\":%s}", json);
         send_json(client, 200, wrap); free(wrap); free(json); return;
+    }
+
+    /* PUT /api/canvas/:cid/nodes/:nid/position */
+    if (strcmp(method, "PUT")==0 && nseg==6 && strcmp(segs[5], "position")==0) {
+        Node *node = find_node(canvas, nid);
+        if (!node) { send_error(client, 404, "Node not found"); return; }
+        const char *x_marker = strstr(body, "\"x\"");
+        const char *y_marker = strstr(body, "\"y\"");
+        if (!x_marker || !y_marker) { send_error(client, 400, "Position requires numeric x and y"); return; }
+        node->x = extract_num(body, "x"); node->y = extract_num(body, "y");
+        char *json = node_to_json(node); char *wrap = malloc(strlen(json)+16);
+        sprintf(wrap, "{\"node\":%s}", json); send_json(client, 200, wrap);
+        free(wrap); free(json); return;
     }
 
     /* PUT /api/canvas/:cid/nodes/:nid/measure */
@@ -678,7 +750,7 @@ static void handle_request(SOCKET client, const char *dist_path) {
  * Main
  * ----------------------------------------------------------------------- */
 
-int main(void) {
+static int server_main(void) {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
@@ -709,3 +781,14 @@ int main(void) {
 #endif
     return 0;
 }
+
+#ifdef GRIDSCAPE_CONTRACT_TEST
+int main(void) {
+    GenResult result = parse_markdown_content("Text with [Term](Term).\n\n## Explore further\n\n- [Prompt](Prompt)");
+    int ok = strcmp(result.text, "Text with [Term](Term).") == 0 && result.prompt_count == 1 && strcmp(result.prompts[0], "Prompt") == 0 && result.link_count == 1 && strcmp(result.links[0].label, "Term") == 0 && strcmp(result.links[0].target, "Term") == 0;
+    free_gen_result(&result);
+    return ok ? 0 : 1;
+}
+#else
+int main(void) { return server_main(); }
+#endif

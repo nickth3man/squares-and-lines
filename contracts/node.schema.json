@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gridscape.local/contracts/node.schema.json",
+  "title": "GridNodeData",
+  "type": "object",
+  "required": [
+    "id",
+    "x",
+    "y",
+    "width",
+    "prompt",
+    "text",
+    "prompts",
+    "links",
+    "status",
+    "versionIndex",
+    "versions"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "x": {
+      "type": "number"
+    },
+    "y": {
+      "type": "number"
+    },
+    "width": {
+      "type": "number"
+    },
+    "height": {
+      "type": "number"
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "prompts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/inlineLink"
+      }
+    },
+    "status": {
+      "enum": [
+        "generating",
+        "ready",
+        "error"
+      ]
+    },
+    "versionIndex": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "versions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/nodeVersion"
+      }
+    },
+    "parentId": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "inlineLink": {
+      "type": "object",
+      "required": [
+        "label",
+        "target"
+      ],
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "nodeVersion": {
+      "type": "object",
+      "required": [
+        "prompt",
+        "text",
+        "prompts",
+        "links"
+      ],
+      "properties": {
+        "prompt": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "prompts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/inlineLink"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

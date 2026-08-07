@@ -1,8 +1,4 @@
 // Gridscape backend — Rust (axum) with stateful canvas management.
-//
-// The backend owns all domain logic: node model, spatial layout, versioning,
-// tree structure, and deletion cascades.
-
 use axum::{
     extract::{Path, State},
     http::{HeaderValue, StatusCode},
@@ -22,10 +18,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tower_http::services::{ServeDir, ServeFile};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const MAX_PROMPT_LENGTH: usize = 2000;
 const NODE_WIDTH: f64 = 400.0;
 
@@ -35,41 +27,47 @@ static HEADING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?im)^##\s+explore further\s*$").unwrap());
 static BULLET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*[-*]\s+\[([^\]]+)\]\([^)]*\)\s*$").unwrap());
-
+static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
-fn now_millis() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
-}
 
-// ---------------------------------------------------------------------------
-// Markdown parser
-// ---------------------------------------------------------------------------
+#[derive(Clone, Serialize)]
+struct InlineLink {
+    label: String,
+    target: String,
+}
 
 #[derive(Clone)]
 struct GenResult {
     text: String,
     prompts: Vec<String>,
+    links: Vec<InlineLink>,
 }
 
 fn parse_markdown_content(raw: &str) -> GenResult {
     let trimmed = raw.trim();
-    if let Some(m) = HEADING_RE.find(trimmed) {
-        let text = trimmed[..m.start()].trim().to_string();
-        let section = &trimmed[m.end()..];
-        let prompts: Vec<String> = BULLET_RE
-            .captures_iter(section)
-            .map(|c| c[1].trim().to_string())
-            .take(3)
-            .collect();
-        GenResult { text, prompts }
+    let (text, section) = if let Some(heading) = HEADING_RE.find(trimmed) {
+        (trimmed[..heading.start()].trim(), &trimmed[heading.end()..])
     } else {
-        GenResult { text: trimmed.to_string(), prompts: vec![] }
+        (trimmed, "")
+    };
+    let prompts = BULLET_RE
+        .captures_iter(section)
+        .map(|capture| capture[1].trim().to_string())
+        .take(3)
+        .collect();
+    let links = LINK_RE
+        .captures_iter(text)
+        .map(|capture| InlineLink {
+            label: capture[1].trim().to_string(),
+            target: capture[2].trim().to_string(),
+        })
+        .collect();
+    GenResult {
+        text: text.to_string(),
+        prompts,
+        links,
     }
 }
-
-// ---------------------------------------------------------------------------
-// LLM provider
-// ---------------------------------------------------------------------------
 
 struct ProviderCfg {
     base_url: &'static str,
@@ -80,19 +78,36 @@ struct ProviderCfg {
 
 fn providers() -> &'static [(&'static str, ProviderCfg)] {
     &[
-        ("openrouter", ProviderCfg { base_url: "https://openrouter.ai/api/v1", api_key_env: "OPENROUTER_API_KEY", model_env: "OPENROUTER_MODEL", default_model: "openai/gpt-oss-20b" }),
-        ("openai", ProviderCfg { base_url: "https://api.openai.com/v1", api_key_env: "OPENAI_API_KEY", model_env: "OPENAI_MODEL", default_model: "gpt-4o-mini" }),
+        (
+            "openrouter",
+            ProviderCfg {
+                base_url: "https://openrouter.ai/api/v1",
+                api_key_env: "OPENROUTER_API_KEY",
+                model_env: "OPENROUTER_MODEL",
+                default_model: "openai/gpt-oss-20b",
+            },
+        ),
+        (
+            "openai",
+            ProviderCfg {
+                base_url: "https://api.openai.com/v1",
+                api_key_env: "OPENAI_API_KEY",
+                model_env: "OPENAI_MODEL",
+                default_model: "gpt-4o-mini",
+            },
+        ),
     ]
 }
 
 async fn call_llm(prompt: &str) -> Result<GenResult, String> {
     let name = env::var("AI_PROVIDER").unwrap_or_else(|_| "openrouter".into());
-    let cfg = providers().iter().find(|(n, _)| *n == name.to_lowercase())
-        .map(|(_, c)| c)
+    let config = providers()
+        .iter()
+        .find(|(provider, _)| *provider == name.to_lowercase())
+        .map(|(_, config)| config)
         .ok_or_else(|| format!("Unknown AI_PROVIDER {name}"))?;
-
-    let api_key = env::var(cfg.api_key_env).unwrap_or_default();
-    let model = env::var(cfg.model_env).unwrap_or_else(|_| cfg.default_model.into());
+    let api_key = env::var(config.api_key_env).unwrap_or_default();
+    let model = env::var(config.model_env).unwrap_or_else(|_| config.default_model.into());
     let body = serde_json::json!({
         "model": model,
         "messages": [
@@ -100,28 +115,29 @@ async fn call_llm(prompt: &str) -> Result<GenResult, String> {
             {"role": "user", "content": prompt},
         ]
     });
-    let client = &*HTTP_CLIENT;
-    let resp = client.post(format!("{}/chat/completions", cfg.base_url))
+    let response = HTTP_CLIENT
+        .post(format!("{}/chat/completions", config.base_url))
         .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        eprintln!("LLM error: {}", resp.status());
-        return Err(format!("LLM provider error"));
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("LLM provider error ({})", response.status()));
     }
-    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let content = data["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    let data: serde_json::Value = response.json().await.map_err(|error| error.to_string())?;
+    let content = data["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
     Ok(parse_markdown_content(content))
 }
-
-// ---------------------------------------------------------------------------
-// Canvas domain model
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Clone)]
 struct NodeVersion {
     prompt: String,
     text: String,
     prompts: Vec<String>,
+    links: Vec<InlineLink>,
 }
 
 #[derive(Serialize, Clone)]
@@ -135,6 +151,7 @@ struct GridNodeData {
     prompt: String,
     text: String,
     prompts: Vec<String>,
+    links: Vec<InlineLink>,
     status: String,
     #[serde(rename = "versionIndex")]
     version_index: usize,
@@ -150,155 +167,197 @@ struct Canvas {
 
 type CanvasStore = Arc<Mutex<HashMap<String, Canvas>>>;
 
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 fn gen_id(prefix: &str) -> String {
     format!("{prefix}-{}-{}", now_millis(), rand_u32() % 1000)
 }
-
 fn rand_u32() -> u32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    SystemTime::now().hash(&mut h);
-    (h.finish() & 0xFFFFFFFF) as u32
+    (now_millis() as u32)
+        .wrapping_mul(1664525)
+        .wrapping_add(1013904223)
 }
-
 fn rand_f64() -> f64 {
     (rand_u32() as f64) / (u32::MAX as f64)
 }
+fn abs(value: f64) -> f64 {
+    if value < 0.0 {
+        -value
+    } else {
+        value
+    }
+}
 
-fn abs(f: f64) -> f64 { if f < 0.0 { -f } else { f } }
-
-// Spatial layout — collision-aware child placement
 fn compute_child_position(parent: &GridNodeData, nodes: &[GridNodeData]) -> (f64, f64) {
     let new_x = parent.x + parent.width + 400.0;
     let initial_offset = if rand_f64() > 0.5 { 200.0 } else { -200.0 };
     let mut new_y = parent.y + initial_offset;
-    let card_h = parent.height.unwrap_or(400.0);
-
+    let card_height = parent.height.unwrap_or(400.0);
     let mut occupied = true;
-    let mut offset_mult = 1.0;
+    let mut offset_multiplier = 1.0;
     let mut direction = if rand_f64() > 0.5 { 1.0 } else { -1.0 };
-
     while occupied {
-        occupied = false;
-        for n in nodes {
-            let n_h = n.height.unwrap_or(400.0);
-            let x_overlap = abs(n.x + NODE_WIDTH / 2.0 - (new_x + NODE_WIDTH / 2.0)) < NODE_WIDTH;
-            let y_overlap = abs(n.y + n_h / 2.0 - (new_y + card_h / 2.0)) < (n_h + card_h) / 2.0;
-            if x_overlap && y_overlap { occupied = true; break; }
-        }
+        occupied = nodes.iter().any(|node| {
+            let node_height = node.height.unwrap_or(400.0);
+            abs(node.x + NODE_WIDTH / 2.0 - (new_x + NODE_WIDTH / 2.0)) < NODE_WIDTH
+                && abs(node.y + node_height / 2.0 - (new_y + card_height / 2.0))
+                    < (node_height + card_height) / 2.0
+        });
         if occupied {
-            new_y = parent.y + initial_offset + card_h * offset_mult * direction;
+            new_y = parent.y + initial_offset + card_height * offset_multiplier * direction;
             direction *= -1.0;
-            if direction == 1.0 { offset_mult += 1.0; }
+            if direction == 1.0 {
+                offset_multiplier += 1.0;
+            }
         }
     }
     (new_x, new_y)
 }
 
-// ---------------------------------------------------------------------------
-// Node operations (async — hold canvas lock across LLM call)
-// ---------------------------------------------------------------------------
-
-async fn canvas_generate(store: &CanvasStore, cid: &str, prompt: &str, parent_id: Option<&str>) -> Result<GridNodeData, String> {
+async fn canvas_generate(
+    store: &CanvasStore,
+    cid: &str,
+    prompt: &str,
+    parent_id: Option<&str>,
+) -> Result<GridNodeData, String> {
     let mut canvases = store.lock().await;
     let canvas = canvases.get_mut(cid).ok_or("Canvas not found")?;
-
-    let (x, y) = if let Some(pid) = parent_id {
-        let parent = canvas.nodes.iter().find(|n| n.id == pid)
-            .ok_or_else(|| format!("Parent {pid} not found"))?;
+    let (x, y) = if let Some(parent_id) = parent_id {
+        let parent = canvas
+            .nodes
+            .iter()
+            .find(|node| node.id == parent_id)
+            .ok_or("Parent not found")?;
         compute_child_position(parent, &canvas.nodes)
-    } else { (0.0, 0.0) };
-
+    } else {
+        (0.0, 0.0)
+    };
     let mut node = GridNodeData {
-        id: gen_id("node"), x, y, width: NODE_WIDTH, height: None,
-        prompt: prompt.to_string(), text: String::new(), prompts: vec![],
-        status: "generating".into(), version_index: 0, versions: vec![],
-        parent_id: parent_id.map(|s| s.to_string()),
+        id: gen_id("node"),
+        x,
+        y,
+        width: NODE_WIDTH,
+        height: None,
+        prompt: prompt.to_string(),
+        text: String::new(),
+        prompts: vec![],
+        links: vec![],
+        status: "generating".into(),
+        version_index: 0,
+        versions: vec![],
+        parent_id: parent_id.map(str::to_string),
     };
     canvas.nodes.push(node.clone());
-
     match call_llm(prompt).await {
         Ok(result) => {
-            node.text = if result.text.is_empty() { "No text".into() } else { result.text.clone() };
-            node.prompts = result.prompts.clone();
+            node.text = if result.text.is_empty() {
+                "No text".into()
+            } else {
+                result.text
+            };
+            node.prompts = result.prompts;
+            node.links = result.links;
             node.status = "ready".into();
             node.versions = vec![NodeVersion {
-                prompt: prompt.to_string(), text: node.text.clone(), prompts: node.prompts.clone(),
+                prompt: prompt.to_string(),
+                text: node.text.clone(),
+                prompts: node.prompts.clone(),
+                links: node.links.clone(),
             }];
         }
-        Err(e) => {
-            eprintln!("Generate error: {e}");
+        Err(error) => {
+            eprintln!("Generate error: {error}");
             node.status = "error".into();
         }
     }
-
-    // Update the stored node
-    if let Some(n) = canvas.nodes.iter_mut().find(|n| n.id == node.id) {
-        *n = node.clone();
+    if let Some(stored) = canvas.nodes.iter_mut().find(|stored| stored.id == node.id) {
+        *stored = node.clone();
     }
     Ok(node)
 }
 
-async fn canvas_regenerate(store: &CanvasStore, cid: &str, nid: &str) -> Result<GridNodeData, String> {
+async fn canvas_regenerate(
+    store: &CanvasStore,
+    cid: &str,
+    nid: &str,
+) -> Result<GridNodeData, String> {
     let mut canvases = store.lock().await;
     let canvas = canvases.get_mut(cid).ok_or("Canvas not found")?;
-    let node = canvas.nodes.iter_mut().find(|n| n.id == nid)
-        .ok_or_else(|| format!("Node {nid} not found"))?;
+    let node = canvas
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == nid)
+        .ok_or("Node not found")?;
     node.status = "generating".into();
-
     let prompt = node.prompt.clone();
     match call_llm(&prompt).await {
         Ok(result) => {
-            let text = if result.text.is_empty() { "No text".into() } else { result.text };
-            let nv = NodeVersion { prompt: prompt.clone(), text: text.clone(), prompts: result.prompts.clone() };
-            node.versions.push(nv);
+            let text = if result.text.is_empty() {
+                "No text".into()
+            } else {
+                result.text
+            };
+            let version = NodeVersion {
+                prompt,
+                text: text.clone(),
+                prompts: result.prompts.clone(),
+                links: result.links.clone(),
+            };
+            node.versions.push(version);
             node.version_index = node.versions.len() - 1;
             node.text = text;
             node.prompts = result.prompts;
+            node.links = result.links;
             node.status = "ready".into();
         }
-        Err(e) => {
-            eprintln!("Regenerate error: {e}");
+        Err(error) => {
+            eprintln!("Regenerate error: {error}");
             node.status = "error".into();
         }
     }
     Ok(node.clone())
 }
 
-// ---------------------------------------------------------------------------
-// Rate limiter
-// ---------------------------------------------------------------------------
-
-struct RateLimiter {
-    log: PLMutex<HashMap<String, Vec<std::time::Instant>>>,
+fn descendants(canvas: &Canvas, id: &str) -> Vec<String> {
+    canvas
+        .nodes
+        .iter()
+        .filter(|node| node.parent_id.as_deref() == Some(id))
+        .flat_map(|node| {
+            let mut result = vec![node.id.clone()];
+            result.extend(descendants(canvas, &node.id));
+            result
+        })
+        .collect()
 }
 
+#[derive(Clone)]
+struct RateLimiter {
+    log: Arc<PLMutex<HashMap<String, Vec<std::time::Instant>>>>,
+}
 impl RateLimiter {
     fn check(&self, ip: &str) -> bool {
         let mut log = self.log.lock();
         let now = std::time::Instant::now();
         let entry = log.entry(ip.to_string()).or_default();
-        entry.retain(|t| now.duration_since(*t).as_secs() < 60);
-        if entry.len() >= 20 { return true; }
+        entry.retain(|time| now.duration_since(*time).as_secs() < 60);
+        if entry.len() >= 20 {
+            return true;
+        }
         entry.push(now);
         false
     }
 }
 
-// ---------------------------------------------------------------------------
-// App state
-// ---------------------------------------------------------------------------
-
 #[derive(Clone)]
 struct AppState {
     store: CanvasStore,
-    limiter: Arc<RateLimiter>,
+    limiter: RateLimiter,
 }
-
-// ---------------------------------------------------------------------------
-// HTTP handlers
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct GenerateBody {
@@ -306,24 +365,31 @@ struct GenerateBody {
     #[serde(rename = "parentId")]
     parent_id: Option<String>,
 }
-
 #[derive(Deserialize)]
 struct VersionBody {
     #[serde(rename = "versionIndex")]
     version_index: usize,
 }
-
 #[derive(Deserialize)]
 struct MeasureBody {
     height: f64,
 }
+#[derive(Deserialize)]
+struct PositionBody {
+    x: f64,
+    y: f64,
+}
 
 async fn handle_create_canvas(State(state): State<AppState>) -> Response {
-    let cid = gen_id("canvas");
-    let mut canvases = state.store.lock().await;
-    canvases.insert(cid.clone(), Canvas { id: cid.clone(), nodes: vec![] });
-    drop(canvases);
-    Json(serde_json::json!({"canvasId": cid})).into_response()
+    let id = gen_id("canvas");
+    state.store.lock().await.insert(
+        id.clone(),
+        Canvas {
+            id: id.clone(),
+            nodes: vec![],
+        },
+    );
+    Json(serde_json::json!({"canvasId": id})).into_response()
 }
 
 async fn handle_generate(
@@ -332,28 +398,46 @@ async fn handle_generate(
     body: Result<Json<GenerateBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Prompt is required"}))).into_response(),
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Prompt is required"})),
+            )
+                .into_response()
+        }
     };
-    let ip = "global"; // ConnectInfo would go here for per-IP
-    if state.limiter.check(ip) {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "Too many requests. Please slow down."}))).into_response();
+    if state.limiter.check("global") {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "Too many requests. Please slow down."})),
+        )
+            .into_response();
     }
     if body.prompt.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Prompt is required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Prompt is required"})),
+        )
+            .into_response();
     }
     if body.prompt.len() > MAX_PROMPT_LENGTH {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Prompt is too long (max {MAX_PROMPT_LENGTH} characters.)")}))).into_response();
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Prompt is too long (max {MAX_PROMPT_LENGTH} characters.")}))).into_response();
     }
     match canvas_generate(&state.store, &cid, &body.prompt, body.parent_id.as_deref()).await {
         Ok(node) => Json(serde_json::json!({"node": node})).into_response(),
-        Err(e) => {
-            eprintln!("Generate error: {e}");
-            if e == "Canvas not found" {
-                (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Canvas not found"}))).into_response()
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to generate text content."}))).into_response()
-            }
+        Err(error) if error == "Canvas not found" => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Canvas not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            eprintln!("Generate error: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to generate text content."})),
+            )
+                .into_response()
         }
     }
 }
@@ -363,15 +447,16 @@ async fn handle_regenerate(
     Path((cid, nid)): Path<(String, String)>,
 ) -> Response {
     if state.limiter.check("global") {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "Too many requests. Please slow down."}))).into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "Too many requests. Please slow down."})),
+        )
+            .into_response();
     }
     match canvas_regenerate(&state.store, &cid, &nid).await {
         Ok(node) => Json(serde_json::json!({"node": node})).into_response(),
-        Err(e) if e.contains("not found") => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Node not found"}))).into_response(),
-        Err(e) => {
-            eprintln!("Regenerate error: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to generate text content."}))).into_response()
-        }
+        Err(error) if error == "Canvas not found" || error == "Node not found" => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": if error == "Canvas not found" { "Canvas not found" } else { "Node not found" }}))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to generate text content."}))).into_response(),
     }
 }
 
@@ -380,93 +465,122 @@ async fn handle_delete(
     Path((cid, nid)): Path<(String, String)>,
 ) -> Response {
     let mut canvases = state.store.lock().await;
-    if let Some(canvas) = canvases.get_mut(&cid) {
-        // Find all descendants
-        fn descendants(canvas: &Canvas, id: &str) -> Vec<String> {
-            let mut result = vec![];
-            for n in &canvas.nodes {
-                if n.parent_id.as_deref() == Some(id) {
-                    result.push(n.id.clone());
-                    result.extend(descendants(canvas, &n.id));
-                }
-            }
-            result
-        }
-        let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
-        to_delete.insert(nid.clone());
-        for d in descendants(canvas, &nid) { to_delete.insert(d); }
-        let deleted: Vec<String> = to_delete.iter().cloned().collect();
-        canvas.nodes.retain(|n| !to_delete.contains(&n.id));
-        Json(serde_json::json!({"deletedIds": deleted})).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Canvas not found"}))).into_response()
+    let Some(canvas) = canvases.get_mut(&cid) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Canvas not found"})),
+        )
+            .into_response();
+    };
+    if !canvas.nodes.iter().any(|node| node.id == nid) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Node not found"})),
+        )
+            .into_response();
     }
+    let mut deleted = vec![nid.clone()];
+    deleted.extend(descendants(canvas, &nid));
+    canvas.nodes.retain(|node| !deleted.contains(&node.id));
+    Json(serde_json::json!({"deletedIds": deleted})).into_response()
 }
 
 async fn handle_version(
     State(state): State<AppState>,
     Path((cid, nid)): Path<(String, String)>,
-    body: Json<VersionBody>,
+    Json(body): Json<VersionBody>,
 ) -> Response {
     let mut canvases = state.store.lock().await;
-    if let Some(canvas) = canvases.get_mut(&cid) {
-        if let Some(node) = canvas.nodes.iter_mut().find(|n| n.id == nid) {
-            node.version_index = body.version_index;
-            if body.version_index < node.versions.len() {
-                let v = &node.versions[body.version_index];
-                node.text = v.text.clone();
-                node.prompts = v.prompts.clone();
-            }
-            return Json(serde_json::json!({"node": node})).into_response();
-        }
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Node not found"}))).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Canvas not found"}))).into_response()
+    let Some(canvas) = canvases.get_mut(&cid) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Canvas not found"})),
+        )
+            .into_response();
+    };
+    let Some(node) = canvas.nodes.iter_mut().find(|node| node.id == nid) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Node not found"})),
+        )
+            .into_response();
+    };
+    node.version_index = body.version_index;
+    if let Some(version) = node.versions.get(body.version_index) {
+        node.text = version.text.clone();
+        node.prompts = version.prompts.clone();
+        node.links = version.links.clone();
     }
+    Json(serde_json::json!({"node": node})).into_response()
+}
+
+async fn handle_position(
+    State(state): State<AppState>,
+    Path((cid, nid)): Path<(String, String)>,
+    Json(body): Json<PositionBody>,
+) -> Response {
+    let mut canvases = state.store.lock().await;
+    let Some(canvas) = canvases.get_mut(&cid) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Canvas not found"})),
+        )
+            .into_response();
+    };
+    let Some(node) = canvas.nodes.iter_mut().find(|node| node.id == nid) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Node not found"})),
+        )
+            .into_response();
+    };
+    node.x = body.x;
+    node.y = body.y;
+    Json(serde_json::json!({"node": node})).into_response()
 }
 
 async fn handle_measure(
     State(state): State<AppState>,
     Path((cid, nid)): Path<(String, String)>,
-    body: Json<MeasureBody>,
+    Json(body): Json<MeasureBody>,
 ) -> Response {
     let mut canvases = state.store.lock().await;
-    if let Some(canvas) = canvases.get_mut(&cid) {
-        if let Some(node) = canvas.nodes.iter_mut().find(|n| n.id == nid) {
-            node.height = Some(body.height);
-        }
+    let Some(canvas) = canvases.get_mut(&cid) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Canvas not found"})),
+        )
+            .into_response();
+    };
+    if let Some(node) = canvas.nodes.iter_mut().find(|node| node.id == nid) {
+        node.height = Some(body.height);
     }
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
-async fn handle_get_nodes(
-    State(state): State<AppState>,
-    Path(cid): Path<String>,
-) -> Response {
+async fn handle_get_nodes(State(state): State<AppState>, Path(cid): Path<String>) -> Response {
     let canvases = state.store.lock().await;
-    if let Some(canvas) = canvases.get(&cid) {
-        Json(serde_json::json!({"nodes": canvas.nodes})).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Canvas not found"}))).into_response()
+    match canvases.get(&cid) {
+        Some(canvas) => Json(serde_json::json!({"nodes": canvas.nodes})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Canvas not found"})),
+        )
+            .into_response(),
     }
 }
 
-// ---------------------------------------------------------------------------
-// CSP middleware
-// ---------------------------------------------------------------------------
-
 async fn csp_middleware(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let mut response = next.run(request).await;
-    response.headers_mut().insert("Content-Security-Policy", HeaderValue::from_static(
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'",
-    ));
+    response.headers_mut().insert("Content-Security-Policy", HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'"));
     response
 }
 
-// ---------------------------------------------------------------------------
-
 fn dist_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("frontend").join("dist")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("frontend")
+        .join("dist")
 }
 
 #[tokio::main]
@@ -475,27 +589,53 @@ async fn main() {
     let port = env::var("PORT").unwrap_or_else(|_| "3000".into());
     let dist = dist_path();
     let serve_dir = ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")));
-
-    let store: CanvasStore = Arc::new(Mutex::new(HashMap::new()));
     let state = AppState {
-        store,
-        limiter: Arc::new(RateLimiter { log: PLMutex::new(HashMap::new()) }),
+        store: Arc::new(Mutex::new(HashMap::new())),
+        limiter: RateLimiter {
+            log: Arc::new(PLMutex::new(HashMap::new())),
+        },
     };
-
     let app = Router::new()
         .route("/api/canvas", post(handle_create_canvas))
         .route("/api/canvas/{cid}/generate", post(handle_generate))
-        .route("/api/canvas/{cid}/nodes/{nid}/regenerate", post(handle_regenerate))
+        .route(
+            "/api/canvas/{cid}/nodes/{nid}/regenerate",
+            post(handle_regenerate),
+        )
         .route("/api/canvas/{cid}/nodes/{nid}", delete(handle_delete))
         .route("/api/canvas/{cid}/nodes/{nid}/version", put(handle_version))
+        .route(
+            "/api/canvas/{cid}/nodes/{nid}/position",
+            put(handle_position),
+        )
         .route("/api/canvas/{cid}/nodes/{nid}/measure", put(handle_measure))
         .route("/api/canvas/{cid}/nodes", get(handle_get_nodes))
         .fallback_service(serve_dir)
         .layer(axum::middleware::from_fn(csp_middleware))
         .with_state(state);
-
     let addr = format!("0.0.0.0:{port}");
     eprintln!("Server running on http://localhost:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_extracts_inline_links_and_prompts() {
+        let result = parse_markdown_content(
+            "Text with [Term](Term).\n\n## Explore further\n\n- [Prompt](Prompt)",
+        );
+        assert_eq!(result.text, "Text with [Term](Term).");
+        assert_eq!(result.prompts, vec!["Prompt"]);
+        assert_eq!(result.links[0].label, "Term");
+        assert_eq!(result.links[0].target, "Term");
+    }
 }

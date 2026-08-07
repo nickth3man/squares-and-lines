@@ -29,9 +29,10 @@ Every backend implements the **exact same contract**. The frontend creates a can
   "prompt": "event horizon",
   "text": "...markdown with [Term](Term) links...",
   "prompts": ["follow-up 1", "follow-up 2", "follow-up 3"],
+  "links": [{ "label": "Term", "target": "Term" }],
   "status": "ready",
   "versionIndex": 1,
-  "versions": [{ "prompt": "...", "text": "...", "prompts": ["..."] }],
+  "versions": [{ "prompt": "...", "text": "...", "prompts": ["..."], "links": [{ "label": "Term", "target": "Term" }] }],
   "parentId": "node-..."
 }
 ```
@@ -44,13 +45,15 @@ Every backend implements the **exact same contract**. The frontend creates a can
 | `DELETE` | `/api/canvas/:id/nodes/:nid` | — | `{ deletedIds: [...] }` |
 | `PUT` | `/api/canvas/:id/nodes/:nid/version` | `{ versionIndex }` | `{ node }` |
 | `PUT` | `/api/canvas/:id/nodes/:nid/measure` | `{ height }` | `{ ok: true }` |
-| `GET` | `/api/canvas/:id/nodes` | — | `{ nodes: [...] }` |
+| `PUT` | `/api/canvas/:id/nodes/:nid/position` | `{ x, y }` | `{ node }` |
 
 - `generate` without `parentId` creates a root node at (0, 0); with `parentId` it places a collision-free child to the right of the parent.
 - `regenerate` adds a new version to the node and switches to it.
 - `delete` removes the node **and all its descendants** (cascade).
 - `measure` records the rendered height so collision avoidance uses real dimensions.
 
+- `links` contains ordered `{ label, target }` metadata for inline clickable terms, so clients do not need to parse markdown links to implement branching.
+- `position` persists user-dragged node coordinates; pan and zoom remain client-side viewport state.
 The LLM contract is **JSON-free by design** — the model returns plain markdown with `[Term](Term)` links and a trailing `## Explore further` section. `parseMarkdownContent` splits these deterministically. Works with any model, including small/free ones that reject structured outputs.
 
 ## Quick Start

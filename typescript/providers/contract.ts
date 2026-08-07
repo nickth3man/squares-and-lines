@@ -8,8 +8,8 @@
 // with two machine-readable conventions:
 //   - [Term](Term) links inline in the text (the branching mechanism),
 //   - a trailing "## Explore further" section of bullet links (the prompts).
-// Both degrade gracefully: missing links -> text-only node, missing section ->
-// node without prompts. Nothing to fail hard.
+// The parser exposes both conventions as structured `links` and `prompts`
+// metadata so clients do not need to parse markdown to implement branching.
 
 export interface InlineLink {
   label: string;

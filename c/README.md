@@ -64,7 +64,7 @@ Stateful canvas sessions (same contract as every backend):
 | `POST` | `/api/canvas/:id/nodes/:nid/regenerate` | — | `{ node }` |
 | `DELETE` | `/api/canvas/:id/nodes/:nid` | — | `{ deletedIds }` |
 | `PUT` | `/api/canvas/:id/nodes/:nid/version` | `{ versionIndex }` | `{ node }` |
-| `PUT` | `/api/canvas/:id/nodes/:nid/measure` | `{ height }` | `{ ok: true }` |
+| `PUT` | `/api/canvas/:id/nodes/:nid/position` | `{ x, y }` | `{ node }` |
 | `GET` | `/api/canvas/:id/nodes` | — | `{ nodes }` |
 
 ## Dev workflow
