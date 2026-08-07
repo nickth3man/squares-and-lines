@@ -6,7 +6,7 @@ import { ErrorBoundary } from './ErrorBoundary';
 
 import ReactMarkdown from 'react-markdown';
 
-const Typewriter = ({ text, onExpand, nodeId }: { text: string, onExpand: (prompt: string, parentId: string) => void, nodeId: string }) => {
+const Typewriter = ({ text, links, onExpand, nodeId }: { text: string, links: GridNodeData['links'], onExpand: (prompt: string, parentId: string) => void, nodeId: string }) => {
   const [isTyping, setIsTyping] = useState(true);
   const [displayedText, setDisplayedText] = useState('');
 
@@ -42,27 +42,26 @@ const Typewriter = ({ text, onExpand, nodeId }: { text: string, onExpand: (promp
     <div className="whitespace-pre-wrap">
       <ReactMarkdown
         components={{
-          a: ({ node: _node, ...props }) => (
-            <button
-              type="button"
-              className="font-bold underline decoration-black decoration-2 hover:bg-yellow-200 transition-colors mx-1 inline"
-              onClick={(e) => {
-                e.stopPropagation();
-                let promptText = props.href || "";
-                if (promptText.startsWith('#')) promptText = promptText.substring(1);
-                promptText = decodeURIComponent(promptText);
-
-                if (Array.isArray(props.children) && typeof props.children[0] === 'string') {
-                  promptText = props.children[0];
-                } else if (typeof props.children === 'string') {
-                  promptText = props.children;
-                }
-                onExpand(promptText, nodeId);
-              }}
-            >
-              {props.children}
-            </button>
-          )
+          a: ({ node: _node, ...props }) => {
+            const href = props.href ? decodeURIComponent(props.href) : '';
+            const label = Array.isArray(props.children) && typeof props.children[0] === 'string'
+              ? props.children[0]
+              : typeof props.children === 'string' ? props.children : '';
+            const link = links.find((candidate) => candidate.target === href && candidate.label === label);
+            if (!link) return <a href={props.href}>{props.children}</a>;
+            return (
+              <button
+                type="button"
+                className="font-bold underline decoration-black decoration-2 hover:bg-yellow-200 transition-colors mx-1 inline"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onExpand(link.target || link.label, nodeId);
+                }}
+              >
+                {props.children}
+              </button>
+            );
+          },
         }}
       >
         {processedText}
@@ -262,7 +261,7 @@ export const NodeCard: React.FC<NodeCardProps> = React.memo(({
             >
               <h3 className="font-bold text-lg mb-3 uppercase tracking-tight">{node.prompt}</h3>
               <ErrorBoundary resetKey={node.id + node.versionIndex}>
-                <Typewriter text={version.text} onExpand={onExpand} nodeId={node.id} />
+                <Typewriter text={version.text} links={version.links} onExpand={onExpand} nodeId={node.id} />
               </ErrorBoundary>
             </div>
           </>

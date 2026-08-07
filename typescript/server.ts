@@ -11,6 +11,7 @@ import {
   regenerateNode,
   deleteNode,
   setNodeVersion,
+  setNodePosition,
   measureNode,
 } from "./canvas";
 
@@ -127,6 +128,23 @@ async function startServer() {
     const { versionIndex } = req.body;
     try {
       const node = setNodeVersion(canvas, req.params.nid, versionIndex);
+      res.json({ node });
+    } catch {
+      res.status(404).json({ error: "Node not found" });
+    }
+  });
+
+  // PUT /api/canvas/:id/nodes/:nid/position — persist user-adjusted position
+  app.put("/api/canvas/:id/nodes/:nid/position", (req, res) => {
+    const canvas = requireCanvas(req, res);
+    if (!canvas) return;
+    const { x, y } = req.body;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      res.status(400).json({ error: "Position requires numeric x and y" });
+      return;
+    }
+    try {
+      const node = setNodePosition(canvas, req.params.nid, x, y);
       res.json({ node });
     } catch {
       res.status(404).json({ error: "Node not found" });

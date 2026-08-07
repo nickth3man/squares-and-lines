@@ -1,3 +1,8 @@
+export interface InlineLink {
+  label: string;
+  target: string;
+}
+
 export interface GridNodeData {
   id: string;
   x: number;
@@ -7,6 +12,7 @@ export interface GridNodeData {
   prompt: string;
   text: string;
   prompts: string[];
+  links: InlineLink[];
   status: 'generating' | 'ready' | 'error';
   versionIndex: number;
   versions: NodeVersion[];
@@ -17,4 +23,5 @@ export interface NodeVersion {
   prompt: string;
   text: string;
   prompts: string[];
+  links: InlineLink[];
 }

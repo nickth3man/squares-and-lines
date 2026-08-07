@@ -11,8 +11,13 @@
 // Both degrade gracefully: missing links -> text-only node, missing section ->
 // node without prompts. Nothing to fail hard.
 
+export interface InlineLink {
+  label: string;
+  target: string;
+}
+
 export interface TextProvider {
-  generateText(prompt: string): Promise<{ text: string; prompts: string[] }>;
+  generateText(prompt: string): Promise<{ text: string; prompts: string[]; links: InlineLink[] }>;
 }
 
 /** Error carrying the upstream HTTP status so routes can surface it. */
@@ -27,19 +32,25 @@ export class ProviderError extends Error {
 
 export const SYSTEM_PROMPT = `You are an infinite spatial-knowledge-engine generator. Respond with markdown text about the user's topic: brief but impactful explanatory text. CRITICAL: wrap 2 to 4 key concepts or interesting terms as clickable markdown links in the exact format [Term](Term) with no spaces, for example 'Machine learning relies on [Supervised Learning](Supervised Learning) and [Neural Networks](Neural Networks).' Do not use bold or italics for those terms. End your response with a section headed exactly '## Explore further' containing exactly 3 bullet-point markdown links, each bullet like '- [A follow-up question](A follow-up question)'. Output only the markdown; no JSON, no code fences.`;
 
-/** Splits markdown output into display text and follow-up prompts. */
-export function parseMarkdownContent(raw: string): { text: string; prompts: string[] } {
+/** Splits markdown output into display text, inline links, and follow-up prompts. */
+export function parseMarkdownContent(raw: string): { text: string; prompts: string[]; links: InlineLink[] } {
+  const extractLinks = (text: string): InlineLink[] =>
+    [...text.matchAll(/\[([^\]]+)\]\(([^)]+)\)/g)].map((match) => ({
+      label: match[1].trim(),
+      target: match[2].trim(),
+    }));
+
   const trimmed = raw.trim();
   const heading = trimmed.match(/^##\s+explore further\s*$/im);
   if (!heading || heading.index === undefined) {
-    return { text: trimmed, prompts: [] };
+    return { text: trimmed, prompts: [], links: extractLinks(trimmed) };
   }
   const text = trimmed.slice(0, heading.index).trim();
   const section = trimmed.slice(heading.index + heading[0].length);
   const prompts = [...section.matchAll(/^\s*[-*]\s+\[([^\]]+)\]\([^)]*\)\s*$/gm)]
     .map((m) => m[1].trim())
     .slice(0, 3);
-  return { text, prompts };
+  return { text, prompts, links: extractLinks(text) };
 }
 
 /** Shared OpenAI-compatible chat-completions caller used by the providers. */
@@ -48,7 +59,7 @@ export async function callChatCompletions(options: {
   apiKey: string | undefined;
   model: string;
   prompt: string;
-}): Promise<{ text: string; prompts: string[] }> {
+}): Promise<{ text: string; prompts: string[]; links: InlineLink[] }> {
   const response = await fetch(`${options.baseUrl}/chat/completions`, {
     method: "POST",
     headers: {

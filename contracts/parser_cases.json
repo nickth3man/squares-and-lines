@@ -1,0 +1,43 @@
+[
+  {
+    "name": "inline links and prompts",
+    "input": "Text about [Topic](Topic) and [Another topic](Another topic).\n\n## Explore further\n\n- [First question](First question)\n- [Second question](Second question)\n- [Third question](Third question)",
+    "text": "Text about [Topic](Topic) and [Another topic](Another topic).",
+    "links": [
+      {
+        "label": "Topic",
+        "target": "Topic"
+      },
+      {
+        "label": "Another topic",
+        "target": "Another topic"
+      }
+    ],
+    "prompts": [
+      "First question",
+      "Second question",
+      "Third question"
+    ]
+  },
+  {
+    "name": "no links",
+    "input": "Just some text without links.",
+    "text": "Just some text without links.",
+    "links": [],
+    "prompts": []
+  },
+  {
+    "name": "links exclude explore section",
+    "input": "Text with [Term](Term).\n\n## Explore further\n\n- [Prompt](Prompt)",
+    "text": "Text with [Term](Term).",
+    "links": [
+      {
+        "label": "Term",
+        "target": "Term"
+      }
+    ],
+    "prompts": [
+      "Prompt"
+    ]
+  }
+]

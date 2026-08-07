@@ -1,8 +1,4 @@
 // Gridscape backend — Go (net/http) with stateful canvas management.
-//
-// The backend owns all domain logic: node model, spatial layout, versioning,
-// tree structure, and deletion cascades. Zero external dependencies.
-
 package main
 
 import (
@@ -19,10 +15,6 @@ import (
 	"sync"
 	"time"
 )
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 const maxPromptLength = 2000
 const nodeWidth = 400.0
@@ -43,39 +35,41 @@ const cspHeader = "default-src 'self'; script-src 'self'; style-src 'self' 'unsa
 var (
 	headingRE = regexp.MustCompile(`(?im)^##\s+explore further\s*$`)
 	bulletRE  = regexp.MustCompile(`(?m)^\s*[-*]\s+\[([^\]]+)\]\([^)]*\)\s*$`)
+	linkRE    = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 )
 
-// ---------------------------------------------------------------------------
-// Markdown parser
-// ---------------------------------------------------------------------------
+type inlineLink struct {
+	Label  string `json:"label"`
+	Target string `json:"target"`
+}
 
 type genResult struct {
-	Text    string   `json:"text"`
-	Prompts []string `json:"prompts"`
+	Text    string       `json:"text"`
+	Prompts []string     `json:"prompts"`
+	Links   []inlineLink `json:"links"`
 }
 
 func parseMarkdownContent(raw string) genResult {
 	trimmed := strings.TrimSpace(raw)
-	loc := headingRE.FindStringIndex(trimmed)
-	if loc == nil {
-		return genResult{Text: trimmed, Prompts: []string{}}
+	text := trimmed
+	section := ""
+	if loc := headingRE.FindStringIndex(trimmed); loc != nil {
+		text = strings.TrimSpace(trimmed[:loc[0]])
+		section = trimmed[loc[1]:]
 	}
-	text := strings.TrimSpace(trimmed[:loc[0]])
-	section := trimmed[loc[1]:]
-	matches := bulletRE.FindAllStringSubmatch(section, -1)
 	prompts := []string{}
-	for _, m := range matches {
-		prompts = append(prompts, strings.TrimSpace(m[1]))
-		if len(prompts) >= 3 {
+	for _, match := range bulletRE.FindAllStringSubmatch(section, -1) {
+		prompts = append(prompts, strings.TrimSpace(match[1]))
+		if len(prompts) == 3 {
 			break
 		}
 	}
-	return genResult{Text: text, Prompts: prompts}
+	links := []inlineLink{}
+	for _, match := range linkRE.FindAllStringSubmatch(text, -1) {
+		links = append(links, inlineLink{Label: strings.TrimSpace(match[1]), Target: strings.TrimSpace(match[2])})
+	}
+	return genResult{Text: text, Prompts: prompts, Links: links}
 }
-
-// ---------------------------------------------------------------------------
-// LLM provider
-// ---------------------------------------------------------------------------
 
 type providerConfig struct {
 	baseURL      string
@@ -90,8 +84,8 @@ var providers = map[string]providerConfig{
 }
 
 func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
 	return fallback
 }
@@ -117,7 +111,7 @@ func callLLM(prompt string) (genResult, error) {
 		return genResult{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		errText, _ := io.ReadAll(resp.Body)
 		log.Printf("Chat completions error: %d %s", resp.StatusCode, string(errText))
 		return genResult{}, fmt.Errorf("LLM provider error (%d)", resp.StatusCode)
@@ -129,7 +123,9 @@ func callLLM(prompt string) (genResult, error) {
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	json.NewDecoder(resp.Body).Decode(&data)
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return genResult{}, err
+	}
 	content := ""
 	if len(data.Choices) > 0 {
 		content = data.Choices[0].Message.Content
@@ -137,14 +133,11 @@ func callLLM(prompt string) (genResult, error) {
 	return parseMarkdownContent(content), nil
 }
 
-// ---------------------------------------------------------------------------
-// Canvas domain model
-// ---------------------------------------------------------------------------
-
 type NodeVersion struct {
-	Prompt  string   `json:"prompt"`
-	Text    string   `json:"text"`
-	Prompts []string `json:"prompts"`
+	Prompt  string       `json:"prompt"`
+	Text    string       `json:"text"`
+	Prompts []string     `json:"prompts"`
+	Links   []inlineLink `json:"links"`
 }
 
 type GridNodeData struct {
@@ -156,6 +149,7 @@ type GridNodeData struct {
 	Prompt       string        `json:"prompt"`
 	Text         string        `json:"text"`
 	Prompts      []string      `json:"prompts"`
+	Links        []inlineLink  `json:"links"`
 	Status       string        `json:"status"`
 	VersionIndex int           `json:"versionIndex"`
 	Versions     []NodeVersion `json:"versions"`
@@ -174,11 +168,11 @@ var (
 
 func createCanvas() *Canvas {
 	cid := fmt.Sprintf("canvas-%d-%d", time.Now().UnixMilli(), rand.IntN(100000))
-	c := &Canvas{ID: cid}
+	canvas := &Canvas{ID: cid}
 	canvasMu.Lock()
-	canvasStore[cid] = c
+	canvasStore[cid] = canvas
 	canvasMu.Unlock()
-	return c
+	return canvas
 }
 
 func getCanvas(cid string) *Canvas {
@@ -191,7 +185,6 @@ func genNodeID() string {
 	return fmt.Sprintf("node-%d-%d", time.Now().UnixMilli(), rand.IntN(1000))
 }
 
-// Spatial layout — collision-aware child placement
 func computeChildPosition(parent *GridNodeData, nodes []*GridNodeData) (float64, float64) {
 	newX := parent.X + parent.Width + 400
 	initialOffset := 200.0
@@ -204,7 +197,7 @@ func computeChildPosition(parent *GridNodeData, nodes []*GridNodeData) (float64,
 		cardHeight = parent.Height
 	}
 	occupied := true
-	offsetMult := 1.0
+	offsetMultiplier := 1.0
 	direction := 1.0
 	if rand.Float64() > 0.5 {
 		direction = -1
@@ -212,36 +205,27 @@ func computeChildPosition(parent *GridNodeData, nodes []*GridNodeData) (float64,
 	for occupied {
 		occupied = false
 		for _, n := range nodes {
-			nH := 400.0
+			nodeHeight := 400.0
 			if n.Height > 0 {
-				nH = n.Height
+				nodeHeight = n.Height
 			}
 			xOverlap := abs(n.X+nodeWidth/2-(newX+nodeWidth/2)) < nodeWidth
-			yOverlap := abs(n.Y+nH/2-(newY+cardHeight/2)) < (nH+cardHeight)/2
+			yOverlap := abs(n.Y+nodeHeight/2-(newY+cardHeight/2)) < (nodeHeight+cardHeight)/2
 			if xOverlap && yOverlap {
 				occupied = true
 				break
 			}
 		}
 		if occupied {
-			newY = parent.Y + initialOffset + cardHeight*offsetMult*direction
+			newY = parent.Y + initialOffset + cardHeight*offsetMultiplier*direction
 			direction *= -1
 			if direction == 1 {
-				offsetMult++
+				offsetMultiplier++
 			}
 		}
 	}
 	return newX, newY
 }
-
-func abs(f float64) float64 {
-	if f < 0 {
-		return -f
-	}
-	return f
-}
-
-// Node operations
 
 func canvasGenerateNode(c *Canvas, prompt, parentID string) (*GridNodeData, error) {
 	var x, y float64
@@ -260,7 +244,7 @@ func canvasGenerateNode(c *Canvas, prompt, parentID string) (*GridNodeData, erro
 	}
 	node := &GridNodeData{
 		ID: genNodeID(), X: x, Y: y, Width: nodeWidth,
-		Prompt: prompt, Status: "generating", Prompts: []string{},
+		Prompt: prompt, Status: "generating", Prompts: []string{}, Links: []inlineLink{},
 		Versions: []NodeVersion{}, ParentID: parentID,
 	}
 	c.Nodes = append(c.Nodes, node)
@@ -274,8 +258,9 @@ func canvasGenerateNode(c *Canvas, prompt, parentID string) (*GridNodeData, erro
 		}
 		node.Text = result.Text
 		node.Prompts = result.Prompts
+		node.Links = result.Links
 		node.Status = "ready"
-		node.Versions = []NodeVersion{{prompt, result.Text, result.Prompts}}
+		node.Versions = []NodeVersion{{Prompt: prompt, Text: node.Text, Prompts: node.Prompts, Links: node.Links}}
 	}
 	return node, nil
 }
@@ -299,30 +284,31 @@ func canvasRegenerateNode(c *Canvas, nodeID string) (*GridNodeData, error) {
 		if result.Text == "" {
 			result.Text = "No text"
 		}
-		nv := NodeVersion{node.Prompt, result.Text, result.Prompts}
+		nv := NodeVersion{Prompt: node.Prompt, Text: result.Text, Prompts: result.Prompts, Links: result.Links}
 		node.Versions = append(node.Versions, nv)
 		node.VersionIndex = len(node.Versions) - 1
 		node.Text = nv.Text
 		node.Prompts = nv.Prompts
+		node.Links = nv.Links
 		node.Status = "ready"
 	}
 	return node, nil
 }
 
 func canvasDeleteNode(c *Canvas, nodeID string) []string {
-	var getDescendants func(id string) []string
-	getDescendants = func(id string) []string {
-		var desc []string
+	var descendants func(string) []string
+	descendants = func(id string) []string {
+		var result []string
 		for _, n := range c.Nodes {
 			if n.ParentID == id {
-				desc = append(desc, n.ID)
-				desc = append(desc, getDescendants(n.ID)...)
+				result = append(result, n.ID)
+				result = append(result, descendants(n.ID)...)
 			}
 		}
-		return desc
+		return result
 	}
 	toDelete := map[string]bool{nodeID: true}
-	for _, id := range getDescendants(nodeID) {
+	for _, id := range descendants(nodeID) {
 		toDelete[id] = true
 	}
 	filtered := c.Nodes[:0]
@@ -332,7 +318,7 @@ func canvasDeleteNode(c *Canvas, nodeID string) []string {
 		}
 	}
 	c.Nodes = filtered
-	var result []string
+	result := []string{}
 	for id := range toDelete {
 		result = append(result, id)
 	}
@@ -343,10 +329,21 @@ func canvasSetVersion(c *Canvas, nodeID string, versionIndex int) (*GridNodeData
 	for _, n := range c.Nodes {
 		if n.ID == nodeID {
 			n.VersionIndex = versionIndex
-			if versionIndex < len(n.Versions) {
+			if versionIndex >= 0 && versionIndex < len(n.Versions) {
 				n.Text = n.Versions[versionIndex].Text
 				n.Prompts = n.Versions[versionIndex].Prompts
+				n.Links = n.Versions[versionIndex].Links
 			}
+			return n, nil
+		}
+	}
+	return nil, fmt.Errorf("node %s not found", nodeID)
+}
+
+func canvasSetPosition(c *Canvas, nodeID string, x, y float64) (*GridNodeData, error) {
+	for _, n := range c.Nodes {
+		if n.ID == nodeID {
+			n.X, n.Y = x, y
 			return n, nil
 		}
 	}
@@ -362,9 +359,12 @@ func canvasMeasureNode(c *Canvas, nodeID string, height float64) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Rate limiter
-// ---------------------------------------------------------------------------
+func abs(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
+}
 
 type ipEntry struct{ timestamps []time.Time }
 
@@ -377,16 +377,16 @@ func rateLimited(ip string) bool {
 	rateMu.Lock()
 	defer rateMu.Unlock()
 	now := time.Now()
-	entry, ok := rateLog[ip]
-	if !ok {
+	entry := rateLog[ip]
+	if entry == nil {
 		entry = &ipEntry{}
 		rateLog[ip] = entry
 	}
 	cutoff := now.Add(-time.Minute)
 	filtered := entry.timestamps[:0]
-	for _, t := range entry.timestamps {
-		if t.After(cutoff) {
-			filtered = append(filtered, t)
+	for _, timestamp := range entry.timestamps {
+		if timestamp.After(cutoff) {
+			filtered = append(filtered, timestamp)
 		}
 	}
 	if len(filtered) >= 20 {
@@ -397,132 +397,140 @@ func rateLimited(ip string) bool {
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// HTTP helpers
-// ---------------------------------------------------------------------------
-
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
 }
-
-// ---------------------------------------------------------------------------
-// HTTP handlers
-// ---------------------------------------------------------------------------
 
 func handleCreateCanvas(w http.ResponseWriter, r *http.Request) {
-	c := createCanvas()
-	writeJSON(w, 200, map[string]string{"canvasId": c.ID})
+	canvas := createCanvas()
+	writeJSON(w, http.StatusOK, map[string]string{"canvasId": canvas.ID})
 }
 
 func handleGenerate(w http.ResponseWriter, r *http.Request) {
-	cid := r.PathValue("cid")
-	c := getCanvas(cid)
-	if c == nil {
-		writeError(w, 404, "Canvas not found")
+	canvas := getCanvas(r.PathValue("cid"))
+	if canvas == nil {
+		writeError(w, http.StatusNotFound, "Canvas not found")
 		return
 	}
 	if rateLimited(r.RemoteAddr) {
-		writeError(w, 429, "Too many requests. Please slow down.")
+		writeError(w, http.StatusTooManyRequests, "Too many requests. Please slow down.")
 		return
 	}
 	var body struct {
 		Prompt   string `json:"prompt"`
 		ParentID string `json:"parentId"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, 400, "Prompt is required")
-		return
-	}
-	if strings.TrimSpace(body.Prompt) == "" {
-		writeError(w, 400, "Prompt is required")
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Prompt) == "" {
+		writeError(w, http.StatusBadRequest, "Prompt is required")
 		return
 	}
 	if len(body.Prompt) > maxPromptLength {
-		writeError(w, 400, fmt.Sprintf("Prompt is too long (max %d characters).", maxPromptLength))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Prompt is too long (max %d characters).", maxPromptLength))
 		return
 	}
-	node, err := canvasGenerateNode(c, body.Prompt, body.ParentID)
+	node, err := canvasGenerateNode(canvas, body.Prompt, body.ParentID)
 	if err != nil {
-		writeError(w, 500, "Failed to generate text content.")
+		writeError(w, http.StatusInternalServerError, "Failed to generate text content.")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"node": node})
+	writeJSON(w, http.StatusOK, map[string]any{"node": node})
 }
 
 func handleRegenerate(w http.ResponseWriter, r *http.Request) {
-	c := getCanvas(r.PathValue("cid"))
-	if c == nil {
-		writeError(w, 404, "Canvas not found")
+	canvas := getCanvas(r.PathValue("cid"))
+	if canvas == nil {
+		writeError(w, http.StatusNotFound, "Canvas not found")
 		return
 	}
 	if rateLimited(r.RemoteAddr) {
-		writeError(w, 429, "Too many requests. Please slow down.")
+		writeError(w, http.StatusTooManyRequests, "Too many requests. Please slow down.")
 		return
 	}
-	node, err := canvasRegenerateNode(c, r.PathValue("nid"))
+	node, err := canvasRegenerateNode(canvas, r.PathValue("nid"))
 	if err != nil {
-		writeError(w, 404, "Node not found")
+		writeError(w, http.StatusNotFound, "Node not found")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"node": node})
+	writeJSON(w, http.StatusOK, map[string]any{"node": node})
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
-	c := getCanvas(r.PathValue("cid"))
-	if c == nil {
-		writeError(w, 404, "Canvas not found")
+	canvas := getCanvas(r.PathValue("cid"))
+	if canvas == nil {
+		writeError(w, http.StatusNotFound, "Canvas not found")
 		return
 	}
-	deleted := canvasDeleteNode(c, r.PathValue("nid"))
-	writeJSON(w, 200, map[string][]string{"deletedIds": deleted})
+	writeJSON(w, http.StatusOK, map[string][]string{"deletedIds": canvasDeleteNode(canvas, r.PathValue("nid"))})
 }
 
 func handleVersion(w http.ResponseWriter, r *http.Request) {
-	c := getCanvas(r.PathValue("cid"))
-	if c == nil {
-		writeError(w, 404, "Canvas not found")
+	canvas := getCanvas(r.PathValue("cid"))
+	if canvas == nil {
+		writeError(w, http.StatusNotFound, "Canvas not found")
 		return
 	}
-	var body struct{ VersionIndex int `json:"versionIndex"` }
-	json.NewDecoder(r.Body).Decode(&body)
-	node, err := canvasSetVersion(c, r.PathValue("nid"), body.VersionIndex)
+	var body struct {
+		VersionIndex int `json:"versionIndex"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	node, err := canvasSetVersion(canvas, r.PathValue("nid"), body.VersionIndex)
 	if err != nil {
-		writeError(w, 404, "Node not found")
+		writeError(w, http.StatusNotFound, "Node not found")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"node": node})
+	writeJSON(w, http.StatusOK, map[string]any{"node": node})
+}
+
+func handlePosition(w http.ResponseWriter, r *http.Request) {
+	canvas := getCanvas(r.PathValue("cid"))
+	if canvas == nil {
+		writeError(w, http.StatusNotFound, "Canvas not found")
+		return
+	}
+	var body struct {
+		X float64 `json:"x"`
+		Y float64 `json:"y"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "Position requires numeric x and y")
+		return
+	}
+	node, err := canvasSetPosition(canvas, r.PathValue("nid"), body.X, body.Y)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Node not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"node": node})
 }
 
 func handleMeasure(w http.ResponseWriter, r *http.Request) {
-	c := getCanvas(r.PathValue("cid"))
-	if c == nil {
-		writeError(w, 404, "Canvas not found")
+	canvas := getCanvas(r.PathValue("cid"))
+	if canvas == nil {
+		writeError(w, http.StatusNotFound, "Canvas not found")
 		return
 	}
-	var body struct{ Height float64 `json:"height"` }
-	json.NewDecoder(r.Body).Decode(&body)
-	canvasMeasureNode(c, r.PathValue("nid"), body.Height)
-	writeJSON(w, 200, map[string]bool{"ok": true})
+	var body struct {
+		Height float64 `json:"height"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	canvasMeasureNode(canvas, r.PathValue("nid"), body.Height)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func handleGetNodes(w http.ResponseWriter, r *http.Request) {
-	c := getCanvas(r.PathValue("cid"))
-	if c == nil {
-		writeError(w, 404, "Canvas not found")
+	canvas := getCanvas(r.PathValue("cid"))
+	if canvas == nil {
+		writeError(w, http.StatusNotFound, "Canvas not found")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"nodes": c.Nodes})
+	writeJSON(w, http.StatusOK, map[string]any{"nodes": canvas.Nodes})
 }
-
-// ---------------------------------------------------------------------------
-// Static file serving + SPA fallback
-// ---------------------------------------------------------------------------
 
 func staticHandler(distPath string) http.HandlerFunc {
 	fileServer := http.FileServer(http.Dir(distPath))
@@ -532,8 +540,7 @@ func staticHandler(distPath string) http.HandlerFunc {
 			return
 		}
 		fullPath := filepath.Join(distPath, filepath.Clean(r.URL.Path))
-		info, err := os.Stat(fullPath)
-		if err == nil && !info.IsDir() {
+		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
 			fileServer.ServeHTTP(w, r)
 			return
 		}
@@ -561,32 +568,28 @@ func loadDotEnv() {
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
-			val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+			value := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
 			if os.Getenv(key) == "" {
-				os.Setenv(key, val)
+				_ = os.Setenv(key, value)
 			}
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------
-
 func main() {
 	loadDotEnv()
 	port := envOr("PORT", "3000")
-
 	distPath, _ := filepath.Abs(filepath.Join("..", "frontend", "dist"))
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/canvas", handleCreateCanvas)
 	mux.HandleFunc("POST /api/canvas/{cid}/generate", handleGenerate)
 	mux.HandleFunc("POST /api/canvas/{cid}/nodes/{nid}/regenerate", handleRegenerate)
 	mux.HandleFunc("DELETE /api/canvas/{cid}/nodes/{nid}", handleDelete)
 	mux.HandleFunc("PUT /api/canvas/{cid}/nodes/{nid}/version", handleVersion)
+	mux.HandleFunc("PUT /api/canvas/{cid}/nodes/{nid}/position", handlePosition)
 	mux.HandleFunc("PUT /api/canvas/{cid}/nodes/{nid}/measure", handleMeasure)
 	mux.HandleFunc("GET /api/canvas/{cid}/nodes", handleGetNodes)
 	mux.HandleFunc("/", staticHandler(distPath))
-
 	addr := ":" + port
 	log.Printf("Server running on http://localhost:%s", port)
 	if err := http.ListenAndServe(addr, cspMiddleware(mux)); err != nil {

@@ -31,12 +31,16 @@ export default function App() {
 
   // Canvas session — created on mount, used for all API calls.
   const canvasIdRef = useRef<string>('');
-  const [canvasReady, setCanvasReady] = useState(false);
 
   useEffect(() => {
     fetch('/api/canvas', { method: 'POST' })
       .then(res => res.json())
- .then(data => { canvasIdRef.current = data.canvasId; setCanvasReady(true); })
+      .then(data => {
+        canvasIdRef.current = data.canvasId;
+        return fetch(`/api/canvas/${data.canvasId}/nodes`);
+      })
+      .then(res => res.json())
+      .then(data => { setNodes(data.nodes || []); })
       .catch(err => console.error('Failed to create canvas session:', err));
   }, []);
   // Panning Support
@@ -90,6 +94,16 @@ export default function App() {
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
+    if (draggingNodeId) {
+      const node = nodesRef.current.find(n => n.id === draggingNodeId);
+      if (node && canvasIdRef.current) {
+        fetch(`/api/canvas/${canvasIdRef.current}/nodes/${node.id}/position`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ x: node.x, y: node.y }),
+        }).catch(error => console.error('Failed to save node position:', error));
+      }
+    }
     setIsDragging(false);
     setDraggingNodeId(null);
     if ((e.target as HTMLElement).hasPointerCapture && (e.target as HTMLElement).hasPointerCapture(e.pointerId)) {
@@ -163,7 +177,7 @@ export default function App() {
     const tempId = `temp-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     const placeholder: GridNodeData = {
       id: tempId, x: estX, y: estY, width: NODE_WIDTH,
-      prompt, text: '', prompts: [],
+      prompt, text: '', prompts: [], links: [],
       status: 'generating', versionIndex: 0, versions: [], parentId,
     };
     setNodes(prev => [...prev, placeholder]);

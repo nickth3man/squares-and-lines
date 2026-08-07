@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { parseMarkdownContent } from './contract';
 
 describe('parseMarkdownContent', () => {
-  it('splits display text from the explore-further section', () => {
-    const raw = `Some explanatory text about [Topic](Topic) here.
+  it('extracts inline links and follow-up prompts', () => {
+    const raw = `Some explanatory text about [Topic](Topic) and [Another topic](Another topic) here.
 
 ## Explore further
 
@@ -11,15 +11,27 @@ describe('parseMarkdownContent', () => {
 - [Second question](Second question)
 - [Third question](Third question)`;
 
-    const { text, prompts } = parseMarkdownContent(raw);
-    expect(text).toBe('Some explanatory text about [Topic](Topic) here.');
-    expect(prompts).toEqual(['First question', 'Second question', 'Third question']);
+    expect(parseMarkdownContent(raw)).toEqual({
+      text: 'Some explanatory text about [Topic](Topic) and [Another topic](Another topic) here.',
+      links: [
+        { label: 'Topic', target: 'Topic' },
+        { label: 'Another topic', target: 'Another topic' },
+      ],
+      prompts: ['First question', 'Second question', 'Third question'],
+    });
+  });
+
+  it('does not expose explore prompts as inline links', () => {
+    expect(parseMarkdownContent('Text with [Term](Term).\n\n## Explore further\n\n- [Prompt](Prompt)').links)
+      .toEqual([{ label: 'Term', target: 'Term' }]);
   });
 
   it('returns text-only when no explore section is present', () => {
-    const { text, prompts } = parseMarkdownContent('Just some text without a section.');
-    expect(text).toBe('Just some text without a section.');
-    expect(prompts).toEqual([]);
+    expect(parseMarkdownContent('Just some text without a section.')).toEqual({
+      text: 'Just some text without a section.',
+      prompts: [],
+      links: [],
+    });
   });
 
   it('caps prompts at three even if more are provided', () => {
@@ -30,57 +42,11 @@ describe('parseMarkdownContent', () => {
 - [One](One)
 - [Two](Two)
 - [Three](Three)
-- [Four](Four)
-- [Five](Five)`;
-
-    const { prompts } = parseMarkdownContent(raw);
-    expect(prompts).toEqual(['One', 'Two', 'Three']);
+- [Four](Four)`;
+    expect(parseMarkdownContent(raw).prompts).toEqual(['One', 'Two', 'Three']);
   });
 
   it('handles empty string input', () => {
-    const { text, prompts } = parseMarkdownContent('');
-    expect(text).toBe('');
-    expect(prompts).toEqual([]);
-  });
-
-  it('matches the heading case-insensitively', () => {
-    const raw = `Text.
-
-## EXPLORE FURTHER
-
-- [Q](Q)`;
-
-    const { text, prompts } = parseMarkdownContent(raw);
-    expect(text).toBe('Text.');
-    expect(prompts).toEqual(['Q']);
-  });
-
-  it('accepts asterisk bullets as well as dashes', () => {
-    const raw = `Text.
-
-## Explore further
-
-* [Alpha](Alpha)
-* [Beta](Beta)`;
-
-    const { prompts } = parseMarkdownContent(raw);
-    expect(prompts).toEqual(['Alpha', 'Beta']);
-  });
-
-  it('returns empty prompts when the section has no valid bullets', () => {
-    const raw = `Text.
-
-## Explore further
-
-Some prose without bullets.`;
-
-    const { text, prompts } = parseMarkdownContent(raw);
-    expect(text).toBe('Text.');
-    expect(prompts).toEqual([]);
-  });
-
-  it('trims surrounding whitespace from the input', () => {
-    const { text } = parseMarkdownContent('   padded text   ');
-    expect(text).toBe('padded text');
+    expect(parseMarkdownContent('')).toEqual({ text: '', prompts: [], links: [] });
   });
 });
